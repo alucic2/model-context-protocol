@@ -14,6 +14,14 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 import httpx
 
+# Optional: repair malformed JSON from LLM responses (e.g. missing commas)
+try:
+    import json_repair
+    JSON_REPAIR_AVAILABLE = True
+except ImportError:
+    JSON_REPAIR_AVAILABLE = False
+    json_repair = None
+
 # Optional Gemini import
 try:
     import google.generativeai as genai
@@ -63,15 +71,24 @@ except ImportError as e:
 LLM_SPECIES_AND_NORMALIZATION_RULES = """
 SPECIES SYNONYMS – use the EXACT value from available_filters:
 - "rabbit", "rabbits", "cottontail", "cottontails", "white cottontail", "white cottontails" → use the species in available_filters that contains "cottontail" (e.g. eastern_cottontail). Pick that exact filter value; do not use "rabbit" or "white cottontail" as the species value.
+- "groundhog", "groundhogs", "whistlepig" → use "woodchuck" if it appears in available_filters (groundhog and woodchuck are the same animal).
+- "ladybug", "ladybugs", "lady bug", "ladybird" → use a species/common-name value containing "lady beetle" or "ladybird" if it appears in available_filters.
+- For partial pest common names like "golden beetle", prefer a longer available common name containing the adjective and pest type (e.g. "golden tortoise beetle") if present.
 - "crow"/"crows" → use "american_crow" if it appears in available_filters.
-- NEVER put action words in species. Words like "eating", "feeding", "walking", "standing", "running" are ACTIONS only → put them in "action", never in "species". Example: "rabbit eating" → species: [eastern_cottontail], action: [foraging]; NOT species: [eating].
+- "american bear", "american bears", "black bear", "black bears", "american black bear", "american black bears" → use "american_black_bear" if it appears in available_filters.
+- "celery" → use "celery" if it appears in available_filters (crop/plant dataset). Do not use only "celery leaftier" or "celery looper" when "celery" itself is available.
+- For goat queries: "tail up", "tail down", "with tail up", "tail up" → add tail_positions: ["up"] or ["down"] (only for goat/goat_2; use exact value that appears in available filters if present).
+- NEVER put action words in species. Words like "eating", "feeding", "walking", "standing", "running", "sleeping" are ACTIONS only → put them in "action", never in "species". Example: "rabbit eating" → species: [eastern_cottontail], action: [foraging]; "cat sleeping" → species: [cat] or [domestic_cat], action: [sleeping]; "dog eating" → species: [dog], action: [eating] or [feeding]. Do NOT output "pin" or "cat, pin" for "cat sleeping"—"sleeping" is the action. Do NOT output species "eating" for "dog eating"—"eating" is the action.
 
 TIME NORMALIZATION – use canonical values that match available_filters:
-- "night time", "nighttime", "at night", "during night", "Nighttime" → time: ["night"] (use "night" if present in available times, otherwise the value that means night).
+- Canonical time values are ALWAYS valid: day, night, dawn, dusk, evening. Use them even if raw metadata strings differ (e.g. "Nighttime" in data → time: ["night"]).
+- "night time", "nighttime", "at night", "during night", "Nighttime" → time: ["night"]
 - "day time", "daytime", "during day" → time: ["day"]
 - "dawn", "sunrise" → time: ["dawn"]
 - "dusk", "sunset" → time: ["dusk"]
-- "evening", "twilight", "late afternoon" → time: ["evening"] (use "evening" if present in available times).
+- "evening", "twilight", "late afternoon" → time: ["evening"]
+
+SPECIES DATASET NAMES – wildlife, livestock, domestic, and plant species use dataset names as filter values (e.g. coyote, bobcat, raspberry). These are valid even when the species list is abbreviated for pests. For pests, use dataset names or pest-type words (moth, beetle) when mentioned.
 """
 
 
@@ -108,6 +125,7 @@ class LLMService:
         self.openai_available = False
         self.is_azure = False
         self.is_project_key = False
+        self.is_azure_openai_v1 = False  # True when endpoint is .../openai/v1 (model in body, not in URL)
         
         # Azure OpenAI (from args or env)
         self.azure_endpoint = (azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT", "")).strip().rstrip("/")
@@ -120,9 +138,16 @@ class LLMService:
         # Prefer Azure when endpoint and key are set
         if self.azure_endpoint and self.azure_api_key:
             self.is_azure = True
-            self.base_url = f"{self.azure_endpoint}/openai/deployments/{self.azure_deployment}/chat/completions?api-version={self.azure_api_version}"
+            ep = self.azure_endpoint.lower().rstrip("/")
+            # OpenAI-compatible Azure API (e.g. .../openai/v1): POST .../chat/completions with model=deployment in body
+            if "/openai/v1" in ep or ep.endswith("/openai/v1"):
+                self.is_azure_openai_v1 = True
+                self.base_url = f"{self.azure_endpoint.rstrip('/')}/chat/completions"
+            else:
+                self.is_azure_openai_v1 = False
+                self.base_url = f"{self.azure_endpoint}/openai/deployments/{self.azure_deployment}/chat/completions?api-version={self.azure_api_version}"
             self.openai_available = True
-            print(f"🧠 Azure OpenAI: endpoint={self.azure_endpoint[:50]}..., deployment={self.azure_deployment}")
+            print(f"🧠 Azure OpenAI: endpoint={self.azure_endpoint[:60]}..., deployment={self.azure_deployment}")
         elif api_key and api_key.startswith("sk-proj-"):
             self.base_url = "https://api.openai.com/v1/chat/completions"
             self.is_project_key = True
@@ -178,13 +203,13 @@ class LLMService:
         
         # Determine which provider to use
         if provider == "auto":
-            # Prefer Gemini if both are available (since OpenAI often has quota issues)
-            if self.gemini_available:
-                self.provider = "gemini"
-                print(f"🧠 Auto-selected: Gemini (both available, preferring Gemini)")
-            elif self.openai_available:
+            # Prefer OpenAI first when both are available (user can set LLM_PROVIDER=gemini to prefer Gemini)
+            if self.openai_available:
                 self.provider = "openai"
-                print(f"🧠 Auto-selected: OpenAI (Gemini not available)")
+                print(f"🧠 Auto-selected: OpenAI (prefer OpenAI; set LLM_PROVIDER=gemini to prefer Gemini)")
+            elif self.gemini_available:
+                self.provider = "gemini"
+                print(f"🧠 Auto-selected: Gemini (OpenAI not available)")
             else:
                 self.provider = None
         else:
@@ -194,6 +219,11 @@ class LLMService:
             print(f"🧠 Using provider: {self.provider}")
             print(f"   OpenAI available: {self.openai_available}")
             print(f"   Gemini available: {self.gemini_available}")
+            if self.provider == "gemini" and self.openai_available:
+                print(
+                    f"   💡 LLM_PROVIDER=gemini — OpenAI/Azure ({self.azure_deployment if self.is_azure else self.model}) "
+                    f"is configured but skipped. Set LLM_PROVIDER=auto to prefer OpenAI first."
+                )
         else:
             print(f"⚠️  No LLM provider available - will use metadata-based fallback")
         
@@ -216,7 +246,7 @@ class LLMService:
                         "category": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Categories to search in (e.g., wildlife, plants, pests)"
+                            "description": "Categories to search in (e.g., wildlife, domestic_animal, livestock, plants, pests)"
                         },
                         "species": {
                             "type": "array",
@@ -273,7 +303,7 @@ class LLMService:
     
     async def understand_query(self, query: str, available_filters: Dict[str, List[str]] = None) -> QueryUnderstanding:
         """Convert natural language query to structured understanding"""
-        # Try providers in order: OpenAI -> Gemini -> Metadata-based
+        # Try providers in order: OpenAI first (when auto or openai), then Gemini if needed, then OpenAI as fallback if Gemini failed, then metadata-based
         print(f"🧠 understand_query called:")
         print(f"   Query: '{query}'")
         print(f"   Provider: {self.provider}")
@@ -281,9 +311,8 @@ class LLMService:
         print(f"   Gemini available: {self.gemini_available}")
         print(f"   Gemini model object: {self.gemini_model_obj is not None}")
         
-        # Try OpenAI first if provider is explicitly "openai" 
-        # (but skip if provider is "auto" and Gemini is available, since we prefer Gemini)
-        openai_should_try = (self.provider == "openai") or (self.provider == "auto" and self.openai_available and not self.gemini_available)
+        # Try OpenAI first when provider is "openai" or "auto" (auto now prefers OpenAI)
+        openai_should_try = (self.provider == "openai") or (self.provider == "auto" and self.openai_available)
         
         if openai_should_try:
             try:
@@ -303,8 +332,8 @@ class LLMService:
         
         # Try Gemini if:
         # 1. Provider is "gemini"
-        # 2. Provider is "auto" and Gemini is available (preferred over OpenAI)
-        # 3. OpenAI was tried but failed
+        # 2. Provider is "auto" and Gemini is available (after OpenAI was tried and failed or skipped)
+        # 3. OpenAI was tried but failed (e.g. quota)
         gemini_should_try = (self.provider == "gemini") or (self.provider == "auto" and self.gemini_available) or (openai_should_try and self.gemini_available)
         
         if gemini_should_try and self.gemini_available:
@@ -319,9 +348,18 @@ class LLMService:
                 print(f"✅ Gemini understanding successful (confidence: {result.confidence})")
                 return result
             except Exception as e:
-                print(f"❌ Gemini error: {e} - falling back to metadata-based...")
+                print(f"❌ Gemini error: {e} - trying OpenAI before metadata fallback...")
                 import traceback
                 traceback.print_exc()
+                # Try OpenAI if we haven't already (e.g. provider was gemini and Gemini failed)
+                if self.openai_available and not openai_should_try:
+                    try:
+                        print(f"🧠 Attempting OpenAI understanding (fallback after Gemini failed)...")
+                        result = await self._openai_understanding(query, available_filters, fallback_after_gemini=True)
+                        print(f"✅ OpenAI understanding successful (fallback)")
+                        return result
+                    except Exception as e2:
+                        print(f"❌ OpenAI fallback error: {e2} - falling back to metadata-based...")
                 # Fall through to metadata-based
         else:
             print(f"⚠️  Gemini not being tried:")
@@ -338,16 +376,37 @@ class LLMService:
         if available_filters and "species" in available_filters:
             print(f"   Available species: {available_filters['species'][:10]}...")  # Show first 10
         return self._metadata_based_understanding(query, available_filters)
+
+    def _openai_chat_payloads(self, messages: List[Dict[str, str]], max_output: int = 500) -> List[Dict[str, Any]]:
+        """Build one or more request bodies compatible with gpt-5-mini / Azure (max_completion_tokens, no temperature)."""
+        model_name = (self.azure_deployment if self.is_azure else self.model or "").lower()
+        gpt5 = "gpt-5" in model_name
+        out_tokens = max(max_output, 64)
+        payloads: List[Dict[str, Any]] = []
+        if self.is_azure or gpt5:
+            payloads.append({"messages": messages, "max_completion_tokens": out_tokens})
+            if not gpt5:
+                payloads.append({"messages": messages, "max_completion_tokens": out_tokens, "temperature": 0.1})
+        payloads.append({"messages": messages, "max_tokens": out_tokens, "temperature": 0.1})
+        for body in payloads:
+            if not self.is_azure:
+                body["model"] = self.model
+            elif getattr(self, "is_azure_openai_v1", False):
+                body["model"] = self.azure_deployment
+        return payloads
     
-    async def _openai_understanding(self, query: str, available_filters: Dict[str, List[str]] = None) -> QueryUnderstanding:
-        """Use OpenAI API for query understanding"""
+    async def _openai_understanding(self, query: str, available_filters: Dict[str, List[str]] = None, *, fallback_after_gemini: bool = False) -> QueryUnderstanding:
+        """Use OpenAI API for query understanding. When fallback_after_gemini=True, 429 is retried once with short delay then we give up so caller can use metadata-based understanding."""
         system_prompt = f"""You are an expert at understanding natural language queries about agricultural and wildlife datasets.
 
 Your task is to convert user queries into structured search criteria.
 
 CRITICAL FIRST STEP: Categorize the query immediately as one of:
 - "pest" (insects, diseases, harmful organisms)
-- "animal" or "wildlife" (mammals, birds, livestock)
+- "wildlife" (wild mammals and birds, e.g. bobcat, coyote, deer — not dogs/cats/goats/chickens)
+- "domestic_animal" (dogs, cats — companion animals)
+- "livestock" (goats, chickens, cattle, pigs, sheep)
+- "animal" (any animal: wildlife + domestic_animal + livestock)
 - "plant" (crops, fruits, vegetables, vegetation)
 
 This categorization helps narrow the search space and improves performance. Always set the "category" filter first.
@@ -364,10 +423,13 @@ Examples:
 - "coyote looking at the camera" → {{"intent": "find coyote images looking at camera", "entities": ["coyote", "looking at camera"], "filters": {{"species": ["coyote"], "action": ["alert"]}}, "confidence": 0.9, "reasoning": "Species and action specification - looking at camera maps to alert"}}
 - "crows" → {{"intent": "find crow images", "entities": ["crow"], "filters": {{"species": ["american_crow"]}}, "confidence": 0.9, "reasoning": "Crow query maps to american_crow species"}}
 - "rabbit eating" → {{"intent": "find rabbit images eating", "entities": ["rabbit", "eating"], "filters": {{"species": ["eastern_cottontail"], "action": ["foraging"]}}, "confidence": 0.95, "reasoning": "Rabbit/cottontail synonym: use eastern_cottontail from filters. 'Eating' is action only → foraging"}}
+- "cat sleeping" → {{"intent": "find cat images sleeping", "entities": ["cat", "sleeping"], "filters": {{"species": ["cat"], "action": ["sleeping"]}}, "confidence": 0.95, "reasoning": "Species is cat; sleeping is action only (never put sleeping or pin in species)"}}
+- "dog eating" → {{"intent": "find dog images eating", "entities": ["dog", "eating"], "filters": {{"species": ["dog"], "action": ["eating"]}}, "confidence": 0.95, "reasoning": "Species is dog; eating is action only (never put eating in species)"}}
 - "white cottontail" → {{"intent": "find white cottontail images", "entities": ["white cottontail"], "filters": {{"species": ["eastern_cottontail"]}}, "confidence": 0.95, "reasoning": "White cottontail maps to eastern_cottontail (same as rabbit) from available filters"}}
 - "horse at night" or "horse at night time" → {{"intent": "find horse images at night", "entities": ["horse", "night"], "filters": {{"species": ["horse"], "time": ["night"]}}, "confidence": 0.95, "reasoning": "Species and time; use canonical time 'night' not 'Nighttime'"}}
 - "animals in summer forest" → {{"intent": "find wildlife in summer forest environment", "entities": ["animals", "summer", "forest"], "filters": {{"category": ["wildlife"], "season": ["summer"], "scene": ["forest"]}}, "confidence": 0.8, "reasoning": "Combined environmental and seasonal criteria"}}
 - "goats in the field" → {{"intent": "find goat images in field environment", "entities": ["goat", "field"], "filters": {{"species": ["goat"], "scene": ["field"]}}, "confidence": 0.9, "reasoning": "Species and scene specification - 'in the field' indicates field scene"}}
+- "bird on a tree" → {{"intent": "find bird images in tree", "entities": ["bird", "tree"], "filters": {{"species": ["american_crow"], "scene": ["tree"]}}, "confidence": 0.9, "reasoning": "Subject is bird; 'on a tree' is scene, not species"}}
 - "predators hunting at dawn" → {{"intent": "find hunting predators at dawn", "entities": ["predators", "hunting", "dawn"], "filters": {{"action": ["hunting"], "time": ["dawn"]}}, "confidence": 0.85, "reasoning": "Behavior and time specification"}}
 - "raspberry ripe" → {{"intent": "find ripe raspberry images", "entities": ["raspberry", "ripe"], "filters": {{"species": ["raspberry"], "plant_state": ["ripe"]}}, "description_query": "close-up of ripe raspberries on a bush with green leaves", "confidence": 0.95, "reasoning": "Species and ripeness specification - 'ripe' maps to plant_state, not action"}}
 - "raspberry red" → {{"intent": "find red/ripe raspberry images", "entities": ["raspberry", "red"], "filters": {{"species": ["raspberry"], "plant_state": ["ripe"]}}, "description_query": "close-up of red ripe raspberries and green foliage", "confidence": 0.9, "reasoning": "Species and color specification - 'red' for berries indicates ripe, maps to plant_state"}}
@@ -380,8 +442,8 @@ DESCRIPTION_QUERY (important for ranking):
 
 IMPORTANT:
 {LLM_SPECIES_AND_NORMALIZATION_RULES}
-- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "crow", "american_crow", "strawberry", "raspberry", "eastern_cottontail")
-- "crow" or "crows" should map to "american_crow" if that's the available species name
+- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "american_crow", "american_black_bear", "strawberry", "raspberry", "eastern_cottontail")
+- "crow" or "crows" should map to "american_crow" if that's the available species name. "american bear", "black bear", or "american black bear" should map to "american_black_bear" if available.
 - ONLY extract species that are in the available_filters list - if a species is not in available_filters, DO NOT extract it as a species filter
 - If the query mentions a species that is NOT in available_filters, return an empty species filter and explain in reasoning that the species is not available
 - Map action keywords to canonical action names:
@@ -389,8 +451,8 @@ IMPORTANT:
   * "sleeping", "resting" → "sleeping" or "resting"
   * "looking at camera", "looking at the camera", "staring at camera", "facing camera", "looking toward camera" → "alert"
   * "walking", "moving" → "walking" or "moving"
-- Extract scene keywords from phrases like "in the field" → scene: ["field"], "in forest" → scene: ["forest"], "in garden" → scene: ["garden"]
-- Scene keywords: field, forest, water, mountain, garden, farm, meadow, indoor, outdoor
+- Extract scene keywords from phrases like "in the field" → scene: ["field"], "in forest" → scene: ["forest"], "in garden" → scene: ["garden"], "on a tree" → scene: ["tree"]. For "X on a tree" (e.g. "bird on a tree") the subject is X (species), not tree — use species: [X], scene: ["tree"].
+- Scene keywords: field, forest, water, mountain, garden, farm, meadow, indoor, outdoor, tree
 - For PLANT/FRUIT queries (raspberry, strawberry, etc.), map ripeness/color descriptors to plant_state, NOT action:
   * "ripe", "red", "mature" → plant_state: ["ripe"] (for fruits/berries)
   * "unripe", "green", "immature" → plant_state: ["unripe"] (for fruits/berries)
@@ -420,53 +482,90 @@ Query: "{query}"
             headers["Authorization"] = f"Bearer {self.api_key}"
             print(f"🧠 Using personal API key authentication")
         
-        # Azure uses deployment in URL; OpenAI expects "model" in body. Both accept "messages", etc.
-        body = {
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 500
-        }
-        if not self.is_azure:
-            body["model"] = self.model
+        # Azure uses deployment in URL (legacy) or model in body (OpenAI-compatible /openai/v1); OpenAI expects "model" in body.
+        payloads = self._openai_chat_payloads(messages, max_output=500)
         
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    self.base_url,
-                    headers=headers,
-                    json=body,
-                    timeout=30.0
-                )
-                
-                print(f"🧠 OpenAI API response status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    content = result["choices"][0]["message"]["content"]
+        max_retries = 1 if fallback_after_gemini else 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = None
+                    for body in payloads:
+                        response = await client.post(
+                            self.base_url,
+                            headers=headers,
+                            json=body,
+                            timeout=90.0
+                        )
+                        if response.status_code == 400 and len(payloads) > 1:
+                            continue
+                        break
+                    if response is None:
+                        raise ValueError("OpenAI API request failed: no response")
                     
-                    try:
-                        # Parse the JSON response
-                        parsed = json.loads(content)
-                        parsed.setdefault("description_query", None)
-                        understanding = QueryUnderstanding(**parsed)
-                        
-                        # Validate that we got real LLM understanding (not empty)
-                        if not understanding.filters and not understanding.entities:
-                            raise ValueError("LLM returned empty understanding")
-                        
-                        return understanding
-                    except Exception as e:
-                        print(f"❌ Failed to parse LLM response: {e}")
-                        print(f"🧠 Raw response content: {content}")
-                        raise ValueError(f"Failed to parse LLM response: {e}")
-                else:
-                    print(f"❌ OpenAI API error: {response.status_code}")
-                    print(f"🧠 Error response: {response.text}")
-                    raise ValueError(f"OpenAI API error: {response.status_code} - {response.text}")
+                    print(f"🧠 OpenAI API response status: {response.status_code}")
                     
-        except Exception as e:
-            print(f"❌ OpenAI API request failed: {e}")
-            raise
+                    if response.status_code == 200:
+                        result = response.json()
+                        content = result["choices"][0]["message"]["content"]
+                        
+                        try:
+                            # Parse the JSON response
+                            parsed = json.loads(content)
+                            parsed.setdefault("description_query", None)
+                            understanding = QueryUnderstanding(**parsed)
+                            
+                            # Validate that we got real LLM understanding (not empty)
+                            if not understanding.filters and not understanding.entities:
+                                raise ValueError("LLM returned empty understanding")
+                            
+                            return understanding
+                        except Exception as e:
+                            print(f"❌ Failed to parse LLM response: {e}")
+                            print(f"🧠 Raw response content: {content}")
+                            raise ValueError(f"Failed to parse LLM response: {e}")
+                    elif response.status_code == 429:
+                        # Rate limit: retry after delay (Azure often suggests 60 seconds)
+                        last_error = ValueError(f"OpenAI API error: 429 - {response.text}")
+                        retry_after = 10 if fallback_after_gemini else 65
+                        try:
+                            hint = response.json()
+                            if "retry" in str(hint).lower() and "second" in str(hint).lower():
+                                import re
+                                m = re.search(r"(\d+)\s*second", response.text, re.I)
+                                if m:
+                                    retry_after = min(120, max(10 if fallback_after_gemini else 65, int(m.group(1)) + 5))
+                        except Exception:
+                            pass
+                        if attempt < max_retries - 1:
+                            print(f"   ⏳ Rate limited (429). Retrying after {retry_after} seconds (attempt {attempt + 1}/{max_retries})...")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        if fallback_after_gemini:
+                            print(f"   ⚠️  429 on OpenAI fallback — giving up after one retry; will use metadata-based understanding.")
+                        print(f"❌ OpenAI API error: {response.status_code}")
+                        print(f"🧠 Error response: {response.text}")
+                        raise last_error
+                    else:
+                        print(f"❌ OpenAI API error: {response.status_code}")
+                        print(f"🧠 Error response: {response.text}")
+                        if response.status_code == 404 and self.is_azure:
+                            print(f"   💡 Azure 404 = resource not found (not an auth problem). Check: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT (must match your deployment name in Azure portal), AZURE_OPENAI_API_VERSION")
+                        raise ValueError(f"OpenAI API error: {response.status_code} - {response.text}")
+            except ValueError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    print(f"   ⏳ Request failed: {e}. Retrying in 5 seconds (attempt {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(5)
+                    continue
+                print(f"❌ OpenAI API request failed: {e}")
+                raise
+        
+        if last_error:
+            raise last_error
     
     async def _gemini_understanding(self, query: str, available_filters: Dict[str, List[str]] = None) -> QueryUnderstanding:
         """Use Google Gemini API for query understanding"""
@@ -512,10 +611,13 @@ Examples:
 - "coyote looking at the camera" → {{"intent": "find coyote images looking at camera", "entities": ["coyote", "looking at camera"], "filters": {{"species": ["coyote"], "action": ["alert"]}}, "confidence": 0.9, "reasoning": "Species and action specification - looking at camera maps to alert"}}
 - "crows" → {{"intent": "find crow images", "entities": ["crow"], "filters": {{"species": ["american_crow"]}}, "confidence": 0.9, "reasoning": "Crow query maps to american_crow species"}}
 - "rabbit eating" → {{"intent": "find rabbit images eating", "entities": ["rabbit", "eating"], "filters": {{"species": ["eastern_cottontail"], "action": ["foraging"]}}, "confidence": 0.95, "reasoning": "Rabbit/cottontail synonym: use eastern_cottontail from filters. 'Eating' is action only → foraging"}}
+- "cat sleeping" → {{"intent": "find cat images sleeping", "entities": ["cat", "sleeping"], "filters": {{"species": ["cat"], "action": ["sleeping"]}}, "confidence": 0.95, "reasoning": "Species is cat; sleeping is action only (never put sleeping or pin in species)"}}
+- "dog eating" → {{"intent": "find dog images eating", "entities": ["dog", "eating"], "filters": {{"species": ["dog"], "action": ["eating"]}}, "confidence": 0.95, "reasoning": "Species is dog; eating is action only (never put eating in species)"}}
 - "white cottontail" → {{"intent": "find white cottontail images", "entities": ["white cottontail"], "filters": {{"species": ["eastern_cottontail"]}}, "confidence": 0.95, "reasoning": "White cottontail maps to eastern_cottontail (same as rabbit) from available filters"}}
 - "horse at night" or "horse at night time" → {{"intent": "find horse images at night", "entities": ["horse", "night"], "filters": {{"species": ["horse"], "time": ["night"]}}, "confidence": 0.95, "reasoning": "Species and time; use canonical time 'night' not 'Nighttime'"}}
 - "animals in summer forest" → {{"intent": "find wildlife in summer forest environment", "entities": ["animals", "summer", "forest"], "filters": {{"category": ["wildlife"], "season": ["summer"], "scene": ["forest"]}}, "confidence": 0.8, "reasoning": "Combined environmental and seasonal criteria"}}
 - "goats in the field" → {{"intent": "find goat images in field environment", "entities": ["goat", "field"], "filters": {{"species": ["goat"], "scene": ["field"]}}, "confidence": 0.9, "reasoning": "Species and scene specification - 'in the field' indicates field scene"}}
+- "bird on a tree" → {{"intent": "find bird images in tree", "entities": ["bird", "tree"], "filters": {{"species": ["american_crow"], "scene": ["tree"]}}, "confidence": 0.9, "reasoning": "Subject is bird; 'on a tree' is scene, not species"}}
 - "predators hunting at dawn" → {{"intent": "find hunting predators at dawn", "entities": ["predators", "hunting", "dawn"], "filters": {{"action": ["hunting"], "time": ["dawn"]}}, "confidence": 0.85, "reasoning": "Behavior and time specification"}}
 - "raspberry ripe" → {{"intent": "find ripe raspberry images", "entities": ["raspberry", "ripe"], "filters": {{"species": ["raspberry"], "plant_state": ["ripe"]}}, "confidence": 0.95, "reasoning": "Species and ripeness specification - 'ripe' maps to plant_state, not action"}}
 - "raspberry red" → {{"intent": "find red/ripe raspberry images", "entities": ["raspberry", "red"], "filters": {{"species": ["raspberry"], "plant_state": ["ripe"]}}, "confidence": 0.9, "reasoning": "Species and color specification - 'red' for berries indicates ripe, maps to plant_state"}}
@@ -527,8 +629,8 @@ DESCRIPTION_QUERY: Always provide "description_query" when the user describes wh
 
 IMPORTANT:
 {LLM_SPECIES_AND_NORMALIZATION_RULES}
-- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "crow", "american_crow", "strawberry", "raspberry", "eastern_cottontail")
-- "crow" or "crows" should map to "american_crow" if that's the available species name
+- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "american_crow", "american_black_bear", "strawberry", "raspberry", "eastern_cottontail")
+- "crow" or "crows" should map to "american_crow" if that's the available species name. "american bear", "black bear", or "american black bear" should map to "american_black_bear" if available.
 - ONLY extract species that are in the available_filters list - if a species is not in available_filters, DO NOT extract it as a species filter
 - If the query mentions a species that is NOT in available_filters, return an empty species filter and explain in reasoning that the species is not available
 - For PLANT/FRUIT queries (raspberry, strawberry, etc.), map ripeness/color/edibility descriptors to plant_state, NOT action:
@@ -641,8 +743,8 @@ DESCRIPTION_QUERY: Always provide "description_query" when the user describes wh
 
 IMPORTANT:
 {LLM_SPECIES_AND_NORMALIZATION_RULES}
-- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "crow", "american_crow", "strawberry", "raspberry", "eastern_cottontail")
-- "crow" or "crows" should map to "american_crow" if that's the available species name
+- Extract species names EXACTLY as they appear in available filters (e.g., "bobcat", "coyote", "american_crow", "american_black_bear", "strawberry", "raspberry", "eastern_cottontail")
+- "crow" or "crows" should map to "american_crow" if that's the available species name. "american bear", "black bear", or "american black bear" should map to "american_black_bear" if available.
 - ONLY extract species that are in the available_filters list - if a species is not in available_filters, DO NOT extract it as a species filter
 - If the query mentions a species that is NOT in available_filters, return an empty species filter and explain in reasoning that the species is not available
 - Map action keywords to canonical action names:
@@ -650,8 +752,8 @@ IMPORTANT:
   * "sleeping", "resting" → "sleeping" or "resting"
   * "looking at camera", "looking at the camera", "staring at camera", "facing camera", "looking toward camera" → "alert"
   * "walking", "moving" → "walking" or "moving"
-- Extract scene keywords from phrases like "in the field" → scene: ["field"], "in forest" → scene: ["forest"], "in garden" → scene: ["garden"]
-- Scene keywords: field, forest, water, mountain, garden, farm, meadow, indoor, outdoor
+- Extract scene keywords from phrases like "in the field" → scene: ["field"], "in forest" → scene: ["forest"], "in garden" → scene: ["garden"], "on a tree" → scene: ["tree"]. For "X on a tree" (e.g. "bird on a tree") the subject is X (species), not tree — use species: [X], scene: ["tree"].
+- Scene keywords: field, forest, water, mountain, garden, farm, meadow, indoor, outdoor, tree
 - For PLANT/FRUIT queries (raspberry, strawberry, etc.), map ripeness/color/edibility descriptors to plant_state, NOT action:
   * "ripe", "red", "mature" → plant_state: ["ripe"] (for fruits/berries)
   * "unripe", "green", "immature" → plant_state: ["unripe"] (for fruits/berries)
@@ -664,10 +766,11 @@ IMPORTANT:
 - Only use filters that are explicitly mentioned in the query OR semantically implied (edibility → ripeness for fruits)
 - Species names must match exactly (case-insensitive) with available filter values
 - Return ONLY valid JSON, no markdown formatting or code blocks
+- Keep the JSON compact: use a single line if possible and do not put newline characters inside string values (avoids truncation)
 
 Query: "{query}"
 """
-        
+
         full_prompt = f"{system_prompt}\n\nUser query: {query}\n\nReturn the JSON response:"
         
         # Use Gemini REST API v1
@@ -686,7 +789,7 @@ Query: "{query}"
             }],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 500,
+                "maxOutputTokens": 1024,
             }
         }
         
@@ -736,22 +839,83 @@ Query: "{query}"
                 try:
                     parsed = json.loads(content)
                 except json.JSONDecodeError as json_err:
-                    # Try to fix common JSON issues
                     import re
                     content_fixed = re.sub(r',(\s*[}\]])', r'\1', content)
                     parsed = None
                     try:
                         parsed = json.loads(content_fixed)
                     except json.JSONDecodeError:
-                        # Try repairing unterminated string (Gemini sometimes truncates)
-                        if "Unterminated" in str(json_err) and "string" in str(json_err):
-                            last_quote = content_fixed.rfind('"')
-                            if last_quote > 0:
-                                repair = content_fixed[:last_quote + 1] + '"}'
+                        pass
+                    # Optional: use json_repair for robust fix of missing commas, trailing commas, etc.
+                    if parsed is None and JSON_REPAIR_AVAILABLE and json_repair is not None:
+                        try:
+                            parsed = json_repair.loads(content_fixed)
+                        except Exception:
+                            pass
+                    # Repair missing comma between tokens (e.g. "key": "value" "key2" -> add comma before "key2")
+                    if parsed is None and "Expecting ',' delimiter" in str(json_err):
+                        # Fix adjacent quoted strings with only whitespace (missing comma)
+                        content_comma = re.sub(r'"(\s+)"', r'", "', content_fixed)
+                        try:
+                            parsed = json.loads(content_comma)
+                        except json.JSONDecodeError:
+                            pass
+                        # Try inserting comma at error position (use original content; position is from first parse)
+                        if parsed is None:
+                            pos_match = re.search(r'char\s+(\d+)', str(json_err))
+                            if pos_match:
+                                pos = int(pos_match.group(1))
+                                for src in (content, content_fixed):
+                                    if parsed is not None:
+                                        break
+                                    for insert_at in (pos, max(0, pos - 1), max(0, pos - 2), min(len(src), pos + 1)):
+                                        if 0 <= insert_at <= len(src):
+                                            candidate = src[:insert_at] + ',' + src[insert_at:]
+                                            try:
+                                                parsed = json.loads(candidate)
+                                                break
+                                            except json.JSONDecodeError:
+                                                continue
+                    # Repair truncated JSON (Gemini sometimes stops mid-response)
+                    if parsed is None and ("Unterminated" in str(json_err) or "Expecting" in str(json_err)):
+                        # Option A: truncate at error position if reported (e.g. "char 60")
+                        pos_match = re.search(r'char\s+(\d+)', str(json_err))
+                        if pos_match:
+                            pos = int(pos_match.group(1))
+                            truncated = content_fixed[:pos].rstrip().rstrip(',').rstrip()
+                            if truncated.startswith('{') and not truncated.endswith('}'):
+                                truncated += '}'
+                                try:
+                                    parsed = json.loads(truncated)
+                                except json.JSONDecodeError:
+                                    parsed = None
+                                if parsed is not None:
+                                    parsed.setdefault("intent", query[:100] if query else "search")
+                                    parsed.setdefault("entities", [])
+                                    parsed.setdefault("filters", {})
+                                    parsed.setdefault("confidence", 0.7)
+                                    parsed.setdefault("reasoning", "Response was truncated; partial parse used.")
+                                    parsed.setdefault("description_query", None)
+                        # Option B: remove incomplete trailing key/value and close
+                        if parsed is None:
+                            repair = content_fixed.strip()
+                            if repair and repair.startswith('{') and not repair.rstrip().endswith('}'):
+                                repair = re.sub(r',\s*"[^"]*$', '', repair)
+                                repair = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*$', '', repair)
+                                repair = repair.rstrip().rstrip(',').rstrip()
+                                if repair.startswith('{') and not repair.endswith('}'):
+                                    repair += '}'
                                 try:
                                     parsed = json.loads(repair)
                                 except json.JSONDecodeError:
-                                    pass
+                                    parsed = None
+                            if parsed is not None:
+                                parsed.setdefault("intent", query[:100] if query else "search")
+                                parsed.setdefault("entities", [])
+                                parsed.setdefault("filters", {})
+                                parsed.setdefault("confidence", 0.7)
+                                parsed.setdefault("reasoning", "Response was truncated; partial parse used.")
+                                parsed.setdefault("description_query", None)
                     if parsed is None:
                         print(f"🧠 Failed to parse JSON. Content (first 500 chars): {content[:500]}")
                         raise json_err
@@ -827,10 +991,13 @@ Query: "{query}"
         # Pest type words (beetle, butterfly, wasp, etc.) match via common_names so "show me beetles" finds pest images
         common_species = [
             "bobcat", "bobcats",
+            "cat", "cats", "dog", "dogs",  # domestic cat/dog for "cat eating", "dog eating"
+            "bird", "birds",  # for "bird on a tree" etc.
             "coyote", "coyotes",
             "deer",
             "fox", "foxes", "red_fox", "redfox", "red_foxes",
             "crow", "crows", "american_crow", "american_crows",
+            "american bear", "american bears", "black bear", "black bears", "american black bear", "american_black_bear",
             "strawberry", "strawberries",
             "raspberry", "raspberries",
             "chicken", "chickens",
@@ -897,6 +1064,12 @@ Query: "{query}"
             "resting", "moving", "alert", "hunting", "perching", "flying", "blooming", "fruiting",
             "growing", "mature", "stretching", "reaching", "consuming", "lowering", "facing", "engaging",
         }
+        # Stopwords / nonsense that must never be matched as species (from action descriptions leaking into filter extraction)
+        species_stopwords = {
+            "the", "and", "or", "at", "in", "on", "to", "for", "of", "with", "within", "from", "an", "a",
+            "possibly", "appears", "stationary", "looking", "staring", "camera", "enclosure", "animal",
+            "toward", "directly", "king", "pea", "tan", "thin",
+        }
         # First, try to match against actual available filter values (unless we already exact-matched)
         # Single-word query: prefer SHORT/one-word species. Multi-word: prefer more words/longest first.
         if "species" in available_filters and not species_matched:
@@ -913,6 +1086,12 @@ Query: "{query}"
                 filter_species_lower = filter_species.lower().strip()
                 # Skip filter values that are action verbs (e.g. "eating" in "rabbit eating")
                 if filter_species_lower in action_words:
+                    continue
+                # Skip stopwords / nonsense that leaked from action descriptions into species filters
+                if filter_species_lower in species_stopwords:
+                    continue
+                # "bird on a tree" → species is bird, not tree/trees; skip matching "tree"/"trees" as species when query has "bird"
+                if filter_species_lower in ("tree", "trees") and "bird" in query_lower:
                     continue
                 filter_species_normalized = filter_species_lower.replace("_", "").replace("-", "").replace(" ", "")
                 
@@ -1042,6 +1221,19 @@ Query: "{query}"
                         if opossum_canonical:
                             matched_species = opossum_canonical
                             print(f"   ✅ Mapped opossum/oppossum to species: {matched_species}")
+                    # Bird/birds → american_crow (or first available bird-like species) when available
+                    if matched_species.lower() in ("bird", "birds") and available_filters and "species" in available_filters:
+                        bird_canonical = next((s for s in available_filters["species"] if s and s.lower() == "american_crow"), None) or next(
+                            (s for s in available_filters["species"] if "crow" in s.lower() or "bird" in s.lower()), None)
+                        if bird_canonical:
+                            matched_species = bird_canonical
+                            print(f"   ✅ Mapped bird/birds to species: {bird_canonical}")
+                    # American bear / black bear → american_black_bear when available
+                    if matched_species.lower().replace(" ", "_") in ("american_bear", "american_bears", "black_bear", "black_bears", "american_black_bear") and available_filters and "species" in available_filters:
+                        bear_canonical = next((s for s in available_filters["species"] if s and s.lower() == "american_black_bear"), None)
+                        if bear_canonical:
+                            matched_species = bear_canonical
+                            print(f"   ✅ Mapped american bear/black bear to species: {bear_canonical}")
                     
                     entities.append(matched_species)
                     filters["species"].append(matched_species)
@@ -1051,23 +1243,35 @@ Query: "{query}"
                 
                 # Strategy 2: Normalized matching (handles underscores, hyphens, spaces)
                 # This handles "red fox" matching "red_fox" or "redfox"
+                # For short names (<=5 chars) require whole-word match so "ring" does not match inside "during"
                 if species_normalized in query_normalized and len(species_normalized) >= 3:
-                    # Make sure it's not a partial match (e.g., "cat" in "bobcat" should match "bobcat" not just "cat")
-                    if len(species_normalized) >= 4 or species_normalized in ["fox", "cat", "pig", "rabbit", "cottontail", "whitecottontail", "opossum", "oppossum"]:
-                        resolved = species
-                        if species.lower() in ("rabbit", "rabbits", "cottontail", "cottontails", "white_cottontail", "white_cottontails") and available_filters and "species" in available_filters:
-                            cottontail_canonical = next((s for s in available_filters["species"] if s and s.lower() == "eastern_cottontail"), None) or next((s for s in available_filters["species"] if "cottontail" in s.lower()), None)
-                            if cottontail_canonical:
-                                resolved = cottontail_canonical
-                        if species.lower() in ("opossum", "opossums", "oppossum", "oppossums") and available_filters and "species" in available_filters:
-                            opossum_canonical = next((s for s in available_filters["species"] if "opossum" in s.lower()), None)
-                            if opossum_canonical:
-                                resolved = opossum_canonical
-                        entities.append(resolved)
-                        filters["species"].append(resolved)
-                        print(f"   ✅ Matched species (normalized): {resolved} from query")
-                        species_matched = True
-                        break
+                    if len(species_normalized) <= 5:
+                        pattern = r"\b" + re.escape(species_lower.replace("_", " ").replace("-", " ")) + r"\b"
+                        if not re.search(pattern, query_lower):
+                            pass  # skip: short species not as whole word (e.g. "ring" in "during")
+                        else:
+                            pass  # fall through to resolution
+                    if len(species_normalized) > 5 or re.search(r"\b" + re.escape(species_lower.replace("_", " ").replace("-", " ")) + r"\b", query_lower):
+                        # Make sure it's not a partial match (e.g., "cat" in "bobcat" should match "bobcat" not just "cat")
+                        if len(species_normalized) >= 4 or species_normalized in ["fox", "cat", "pig", "rabbit", "cottontail", "whitecottontail", "opossum", "oppossum"]:
+                            resolved = species
+                            if species.lower() in ("rabbit", "rabbits", "cottontail", "cottontails", "white_cottontail", "white_cottontails") and available_filters and "species" in available_filters:
+                                cottontail_canonical = next((s for s in available_filters["species"] if s and s.lower() == "eastern_cottontail"), None) or next((s for s in available_filters["species"] if "cottontail" in s.lower()), None)
+                                if cottontail_canonical:
+                                    resolved = cottontail_canonical
+                            if species.lower() in ("opossum", "opossums", "oppossum", "oppossums") and available_filters and "species" in available_filters:
+                                opossum_canonical = next((s for s in available_filters["species"] if "opossum" in s.lower()), None)
+                                if opossum_canonical:
+                                    resolved = opossum_canonical
+                            if species.lower().replace(" ", "_") in ("american_bear", "american_bears", "black_bear", "black_bears") and available_filters and "species" in available_filters:
+                                bear_canonical = next((s for s in available_filters["species"] if s and s.lower() == "american_black_bear"), None)
+                                if bear_canonical:
+                                    resolved = bear_canonical
+                            entities.append(resolved)
+                            filters["species"].append(resolved)
+                            print(f"   ✅ Matched species (normalized): {resolved} from query")
+                            species_matched = True
+                            break
                 
                 # Strategy 3: Handle plurals (e.g., "strawberries" -> "strawberry", "pigs" -> "pig")
                 base_species = species_normalized.rstrip('s')
@@ -1078,6 +1282,10 @@ Query: "{query}"
                         cottontail_canonical = next((s for s in available_filters["species"] if s and s.lower() == "eastern_cottontail"), None) or next((s for s in available_filters["species"] if "cottontail" in s.lower()), None)
                         if cottontail_canonical:
                             resolved = cottontail_canonical
+                    if species.lower().replace(" ", "_") in ("american_bear", "american_bears", "black_bear", "black_bears") and available_filters and "species" in available_filters:
+                        bear_canonical = next((s for s in available_filters["species"] if s and s.lower() == "american_black_bear"), None)
+                        if bear_canonical:
+                            resolved = bear_canonical
                     entities.append(resolved)
                     filters["species"].append(resolved)
                     print(f"   ✅ Matched species (plural): {resolved} from query")
@@ -1088,17 +1296,44 @@ Query: "{query}"
             print(f"   ⚠️  No species matched from query '{query_lower}'")
             print(f"   Available species to check were: {species_to_check[:20]}...")  # Show first 20
         
-        # Match time from available filters (MCP uses "times" key, filter uses "time")
-        if "times" in available_filters:
-            time_keywords = ["night", "day", "dawn", "dusk", "morning", "afternoon", "evening"]
-            for time_val in available_filters["times"]:
-                time_lower = time_val.lower()
-                # Check if query contains this time value or related keywords
-                for keyword in time_keywords:
-                    if keyword in query_lower and keyword in time_lower:
-                        entities.append(time_val)
-                        filters["time"].append(time_val)
-                        break
+        # Match time from query using canonical keywords only (adapter matches by concept: day/daytime, night, etc.)
+        # Do NOT add every dataset "time" value that contains the keyword (e.g. hundreds of "Daytime (11:40 AM)...")
+        time_keywords = ["night", "day", "dawn", "dusk", "morning", "afternoon", "evening"]
+        # Map query phrases to canonical filter value (adapter uses these to set is_day, is_night, etc.)
+        time_phrase_to_canonical = {
+            "daytime": "day", "day time": "day", "during day": "day",
+            "nighttime": "night", "night time": "night", "at night": "night", "during night": "night",
+            "sunrise": "dawn", "sunset": "dusk", "twilight": "evening", "late afternoon": "evening",
+        }
+        time_matched = set()
+        for keyword in time_keywords:
+            if keyword in query_lower:
+                time_matched.add(keyword)
+        for phrase, canonical in time_phrase_to_canonical.items():
+            if phrase in query_lower:
+                time_matched.add(canonical)
+        for t in sorted(time_matched):
+            if t not in filters["time"]:
+                entities.append(t)
+                filters["time"].append(t)
+        
+        # Match weather from query using canonical keywords (adapter matches by substring in metadata.weather)
+        weather_keywords = ["sunny", "rainy", "clear", "cloudy", "overcast", "foggy", "snow", "snowy", "dry", "wet"]
+        weather_phrase_to_canonical = {
+            "clear sky": "clear", "clear skies": "clear", "blue sky": "clear",
+            "raining": "rainy", "rain": "rainy", "sun": "sunny", "sunshine": "sunny",
+        }
+        weather_matched = set()
+        for keyword in weather_keywords:
+            if keyword in query_lower:
+                weather_matched.add(keyword)
+        for phrase, canonical in weather_phrase_to_canonical.items():
+            if phrase in query_lower:
+                weather_matched.add(canonical)
+        for w in sorted(weather_matched):
+            if w not in filters["weather"]:
+                entities.append(w)
+                filters["weather"].append(w)
         
         # Match season from available filters (MCP uses "seasons" key, filter uses "season")
         if "seasons" in available_filters:
@@ -1397,6 +1632,70 @@ Query: "{query}"
             if "plant_states" in available_filters:
                 print(f"   Available plant states were: {available_filters['plant_states'][:10]}...")
         
+        # Match scene from query (e.g. "on a tree", "in the field", "forest")
+        scene_keywords = ["forest", "field", "water", "mountain", "garden", "farm", "meadow", "indoor", "outdoor", "tree"]
+        scene_phrases = {
+            "field": ["in the field", "in field", "on field", "field"],
+            "forest": ["in forest", "in the forest", "forest"],
+            "tree": ["on a tree", "on tree", "in a tree", "in tree", "in the tree"],
+            "garden": ["in garden", "in the garden", "garden"],
+            "farm": ["on farm", "on the farm", "farm"],
+            "meadow": ["in meadow", "in the meadow", "meadow"],
+            "indoor": ["indoors", "indoor", "inside"],
+            "outdoor": ["outdoors", "outdoor", "outside"]
+        }
+        for scene, phrases in scene_phrases.items():
+            for phrase in phrases:
+                if phrase in query_lower and scene not in filters["scene"]:
+                    filters["scene"].append(scene)
+                    if scene not in entities:
+                        entities.append(scene)
+                    print(f"   ✅ Matched scene (phrase): {scene} from '{phrase}'")
+                    break
+        for scene in scene_keywords:
+            if scene in query_lower and scene not in filters["scene"]:
+                filters["scene"].append(scene)
+                if scene not in entities:
+                    entities.append(scene)
+                print(f"   ✅ Matched scene (keyword): {scene}")
+        
+        # "bird on a tree" → species = bird, scene = tree (not species = trees)
+        if "bird" in query_lower and ("tree" in query_lower or "on a tree" in query_lower):
+            species_is_tree_only = not filters.get("species") or all(
+                s.lower().strip() in ("tree", "trees") or (len(s) < 15 and "tree" in s.lower() and "crow" not in s.lower() and "bird" not in s.lower())
+                for s in filters["species"]
+            )
+            if species_is_tree_only and available_filters and "species" in available_filters:
+                bird_species = next((s for s in available_filters["species"] if s and s.lower() == "american_crow"), None) or next(
+                    (s for s in available_filters["species"] if "crow" in s.lower() or "bird" in s.lower()), None)
+                if bird_species:
+                    filters["species"] = [bird_species]
+                    if "tree" not in filters["scene"]:
+                        filters["scene"].append("tree")
+                    print(f"   ✅ Metadata fix: \"bird on a tree\" → species [{bird_species}], scene [tree]")
+        
+        # Never leave action words in species (e.g. "cat eating" parsed as species ["eating"] by substring match)
+        action_only_words = {"eating", "feeding", "foraging"}
+        if filters.get("species"):
+            species_cleaned = [s for s in filters["species"] if s and s.lower().strip().replace(" ", "_") not in action_words]
+            if len(species_cleaned) < len(filters["species"]):
+                filters["species"] = species_cleaned
+                print(f"   ✅ Removed action words from species; species now: {filters['species']}")
+            # If the only "species" was an action word and query is "cat eating" / "dog eating", set species and action correctly
+            if not filters["species"] and (action_only_words & set(query_lower.split())):
+                if "dog" in query_lower:
+                    filters["species"] = ["dog"]
+                    action_word = next((w for w in action_only_words if w in query_lower), "eating")
+                    if action_word not in filters["action"]:
+                        filters["action"].append(action_word)
+                    print(f"   ✅ Metadata fix: 'X eating' → species ['dog'], action [{action_word}]")
+                elif "cat" in query_lower:
+                    filters["species"] = ["cat"]
+                    action_word = next((w for w in action_only_words if w in query_lower), "eating")
+                    if action_word not in filters["action"]:
+                        filters["action"].append(action_word)
+                    print(f"   ✅ Metadata fix: 'X eating' → species ['cat'], action [{action_word}]")
+        
         # Determine intent
         if filters["species"]:
             intent = f"find {', '.join(filters['species'])} images"
@@ -1404,6 +1703,8 @@ Query: "{query}"
                 intent += f" that are {', '.join(filters['plant_state'])}"
             if filters["action"]:
                 intent += f" {', '.join(filters['action'])}"
+            if filters["scene"]:
+                intent += f" in {', '.join(filters['scene'])}"
             if filters["time"]:
                 intent += f" at {', '.join(filters['time'])}"
             if filters["season"]:
@@ -1469,6 +1770,18 @@ Query: "{query}"
             if season in query_lower:
                 entities.append(season)
                 filters["season"].append(season)
+        
+        # Extract weather (sunny, rainy, clear sky, cloudy, etc.)
+        weather_keywords = ["sunny", "rainy", "clear", "cloudy", "overcast", "foggy", "snow", "snowy"]
+        weather_phrases = {"clear sky": "clear", "clear skies": "clear", "blue sky": "clear", "raining": "rainy", "rain": "rainy"}
+        for phrase, canonical in weather_phrases.items():
+            if phrase in query_lower and canonical not in filters["weather"]:
+                entities.append(canonical)
+                filters["weather"].append(canonical)
+        for w in weather_keywords:
+            if w in query_lower and w not in filters["weather"]:
+                entities.append(w)
+                filters["weather"].append(w)
         
         # Extract actions
         action_keywords = ["walking", "hunting", "eating", "sleeping", "running", "standing"]

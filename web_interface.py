@@ -11,10 +11,11 @@ import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Request, Form, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 import httpx
 import os
@@ -44,6 +45,18 @@ class WebInterface:
     
     def _setup_middleware(self):
         """Setup CORS and other middleware"""
+        # Return 404 for common scanner/probe paths (reduces log noise from bots)
+        _PROBE_PATHS = frozenset({
+            "/s3.yml", "/s3.yaml", "/s3.properties", "/s3.key", "/s3.secret",
+            "/aws_s3_config.json", "/.env.aws", "/.env.bak", "/s3/.env.bak",
+        })
+        class BlockProbePathsMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                path = request.url.path.rstrip("/") or "/"
+                if path in _PROBE_PATHS or path.startswith("/s3/"):
+                    return JSONResponse(status_code=404, content={"detail": "Not Found"})
+                return await call_next(request)
+        self.app.add_middleware(BlockProbePathsMiddleware)
         self.app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -55,31 +68,44 @@ class WebInterface:
     def _setup_routes(self):
         """Setup web interface routes"""
         
+        @self.app.get("/health")
+        async def health():
+            """Quick check that the web server is up (no MCP dependency)."""
+            return {"status": "ok", "service": "web_interface"}
+        
         @self.app.get("/", response_class=HTMLResponse)
         async def home(request: Request):
             """Home page with search interface"""
             try:
-                # Get available filters from MCP server
-                async with httpx.AsyncClient() as client:
+                # Get available filters from MCP server (timeout so page still loads if MCP is down)
+                async with httpx.AsyncClient(timeout=5.0) as client:
                     response = await client.get(f"{self.mcp_server_url}/api/datasets")
                     datasets_data = response.json()
+                    raw_list = datasets_data.get("datasets") if isinstance(datasets_data, dict) else []
+                    datasets_list = self._normalize_datasets_for_template(raw_list)
+                    all_filters = self._extract_filters_from_datasets(raw_list if isinstance(raw_list, list) else [])
+                    # Count by type for UI (so user can see if wildlife/plants etc. loaded)
+                    by_type = {}
+                    for d in datasets_list:
+                        t = (d.get("type") or "unknown").strip().lower() or "unknown"
+                        by_type[t] = by_type.get(t, 0) + 1
+                    datasets_by_type = dict(sorted(by_type.items()))
                     
-                    # Extract filters from datasets
-                    all_filters = self._extract_filters_from_datasets(datasets_data["datasets"])
-                    
-                return self.templates.TemplateResponse("search_interface.html", {
+                return self.templates.TemplateResponse(request, "search_interface.html", {
                     "request": request,
                     "filters": all_filters,
-                    "datasets": datasets_data["datasets"],
+                    "datasets": datasets_list,
+                    "datasets_by_type": datasets_by_type,
                     "mcp_server_url": self.mcp_server_url
                 })
             except Exception as e:
                 print(f"Error loading home page: {e}")
                 # Return basic interface if MCP server is unavailable
-                return self.templates.TemplateResponse("search_interface.html", {
+                return self.templates.TemplateResponse(request, "search_interface.html", {
                     "request": request,
                     "filters": {},
-                    "datasets": {},
+                    "datasets": [],
+                    "datasets_by_type": {},
                     "mcp_server_url": self.mcp_server_url,
                     "error": "MCP server unavailable"
                 })
@@ -87,7 +113,7 @@ class WebInterface:
         @self.app.get("/search", response_class=HTMLResponse)
         async def search_page(request: Request):
             """Search results page"""
-            return self.templates.TemplateResponse("search_results.html", {
+            return self.templates.TemplateResponse(request, "search_results.html", {
                 "request": request,
                 "results": {},
                 "query": "",
@@ -163,7 +189,7 @@ class WebInterface:
                     datasets_data = response.json()
                     all_filters = self._extract_filters_from_datasets(datasets_data["datasets"])
                 
-                return self.templates.TemplateResponse("search_results.html", {
+                return self.templates.TemplateResponse(request, "search_results.html", {
                     "request": request,
                     "results": search_results,
                     "query": query,
@@ -177,7 +203,7 @@ class WebInterface:
                 print(f"❌ Search error: {e}")
                 import traceback
                 traceback.print_exc()
-                return self.templates.TemplateResponse("search_results.html", {
+                return self.templates.TemplateResponse(request, "search_results.html", {
                     "request": request,
                     "results": {"error": str(e)},
                     "query": query,
@@ -192,15 +218,16 @@ class WebInterface:
             request: Request,
             query: str = Form(""),
             dataset: str = Form(""),
+            category: str = Form(""),
             limit: int = Form(50),
             page: int = Form(1),
             dataset_offset: int = Form(0)
         ):
             """Handle LLM-powered search with intelligent query understanding"""
             try:
-                print(f"🧠 LLM search request: query='{query}', dataset='{dataset}', dataset_offset={dataset_offset}")
+                print(f"🧠 LLM search request: query='{query}', dataset='{dataset}', category='{category}', dataset_offset={dataset_offset}")
                 
-                # Prepare LLM search request
+                # Prepare LLM search request (category restricts by data type: wildlife, domestic_animal, livestock, plants, pests)
                 search_data = {
                     "query": query,
                     "dataset": dataset if dataset else None,
@@ -208,11 +235,14 @@ class WebInterface:
                     "offset": (page - 1) * limit,
                     "dataset_offset": dataset_offset
                 }
+                if category and category.strip():
+                    search_data["category"] = [category.strip()]
                 
                 print(f"🧠 Calling MCP server LLM search with: {search_data}")
                 
                 # Call MCP server LLM search tool (long timeout: LLM + dataset search; server caps datasets for broad queries)
-                async with httpx.AsyncClient(timeout=180.0) as client:
+                llm_search_timeout = httpx.Timeout(30.0, read=300.0)  # 5 min read for slow LLM + many datasets
+                async with httpx.AsyncClient(timeout=llm_search_timeout) as client:
                     response = await client.post(
                         f"{self.mcp_server_url}/mcp/tools/llm_search",
                         json=search_data
@@ -247,15 +277,18 @@ class WebInterface:
                 async with httpx.AsyncClient() as client:
                     response = await client.get(f"{self.mcp_server_url}/api/datasets")
                     datasets_data = response.json()
-                    all_filters = self._extract_filters_from_datasets(datasets_data["datasets"])
+                    raw_list = datasets_data.get("datasets") if isinstance(datasets_data, dict) else []
+                    all_filters = self._extract_filters_from_datasets(raw_list if isinstance(raw_list, list) else [])
+                    datasets_list = self._normalize_datasets_for_template(raw_list)
                 
-                return self.templates.TemplateResponse("llm_search_results.html", {
+                return self.templates.TemplateResponse(request, "llm_search_results.html", {
                     "request": request,
                     "results": search_results,
                     "query": query,
                     "dataset": dataset,
+                    "category": category,
                     "filters": all_filters,
-                    "datasets": datasets_data["datasets"],
+                    "datasets": datasets_list,
                     "current_page": page,
                     "limit": limit,
                     "dataset_offset": search_results.get("dataset_offset", 0),
@@ -268,13 +301,14 @@ class WebInterface:
                 print(f"❌ LLM search error: {e}")
                 import traceback
                 traceback.print_exc()
-                return self.templates.TemplateResponse("llm_search_results.html", {
+                return self.templates.TemplateResponse(request, "llm_search_results.html", {
                     "request": request,
                     "results": {"error": str(e)},
                     "query": query,
                     "dataset": dataset,
+                    "category": category,
                     "filters": {},
-                    "datasets": {},
+                    "datasets": [],
                     "current_page": page,
                     "limit": limit,
                     "dataset_offset": 0,
@@ -387,7 +421,7 @@ class WebInterface:
                         except:
                             pass
                         print(f"❌ MCP server returned error {response.status_code}: {error_detail}")
-                        return self.templates.TemplateResponse("croissant_datasets.html", {
+                        return self.templates.TemplateResponse(request, "croissant_datasets.html", {
                             "request": request,
                             "datasets": [],
                             "total_count": 0,
@@ -433,7 +467,7 @@ class WebInterface:
                     if "detail" in mcp_response:
                         error_msg = mcp_response["detail"]
                     
-                    return self.templates.TemplateResponse("croissant_datasets.html", {
+                    return self.templates.TemplateResponse(request, "croissant_datasets.html", {
                         "request": request,
                         "datasets": datasets,
                         "total_count": len(datasets),
@@ -443,7 +477,7 @@ class WebInterface:
             except httpx.TimeoutException:
                 error_msg = "Request timed out - the crawler may be taking too long. Try again later."
                 print(f"❌ Timeout loading Croissant datasets: {error_msg}")
-                return self.templates.TemplateResponse("croissant_datasets.html", {
+                return self.templates.TemplateResponse(request, "croissant_datasets.html", {
                     "request": request,
                     "datasets": [],
                     "total_count": 0,
@@ -453,7 +487,7 @@ class WebInterface:
                 print(f"❌ Error loading Croissant datasets: {e}")
                 import traceback
                 traceback.print_exc()
-                return self.templates.TemplateResponse("croissant_datasets.html", {
+                return self.templates.TemplateResponse(request, "croissant_datasets.html", {
                     "request": request,
                     "datasets": [],
                     "total_count": 0,
@@ -697,86 +731,166 @@ class WebInterface:
                     images_dir_resolved = images_dir
                     image_path_flat_resolved = image_path_flat
                 flat_to_try = image_path_flat_resolved if image_path_flat_resolved != image_path_flat else image_path_flat
+                # Use resolved base for species subdirs so we look in the same place as the flat path
+                images_base = images_dir_resolved
+                requested_suffix = Path(filename).suffix
+
+                def unique_values(values):
+                    seen = set()
+                    unique = []
+                    for value in values:
+                        if value and value not in seen:
+                            seen.add(value)
+                            unique.append(value)
+                    return unique
+
+                filename_no_ext_variants = unique_values([
+                    filename_no_ext,
+                    filename_no_ext.replace("-", "_"),
+                    filename_no_ext.replace("ref_leaf", "red_leaf"),
+                    filename_no_ext.replace("ref_leaf", "red_leaf").replace("-", "_"),
+                ])
+                filename_variants = unique_values(
+                    [filename] +
+                    [f"{stem}{requested_suffix}" for stem in filename_no_ext_variants if requested_suffix]
+                )
                 
                 def try_species_subdir():
                     if "_" not in filename_no_ext:
                         return None
-                    subdir = filename_no_ext.split("_")[0]
-                    species_dir = images_dir / subdir
-                    sub_path = species_dir / filename
-                    if sub_path.exists() and sub_path.is_file():
-                        return FileResponse(str(sub_path))
-                    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
-                        sub_path = species_dir / f"{filename_no_ext}{ext}"
-                        if sub_path.exists() and sub_path.is_file():
-                            return FileResponse(str(sub_path))
+                    # Try dataset-name subdir first (e.g. domestic_cat for domestic_cat_001), then first segment
+                    import re
+                    subdir_candidates = []
+                    for stem in filename_no_ext_variants:
+                        if re.search(r"_\d+$", stem):
+                            subdir_candidates.append(re.sub(r"_\d+$", "", stem))  # wild_turkey_001 -> wild_turkey
+                        elif "_" in stem:
+                            subdir_candidates.append(stem)  # wild_turkey (no number) -> wild_turkey
+                        subdir_candidates.append(stem.split("_")[0])
+                    subdir_candidates = unique_values(subdir_candidates)
+                    # Case-insensitive subdir match first (e.g. dir is Daktulosphaira_vitifoliae, we have daktulosphaira_vitifoliae)
+                    try:
+                        for candidate in subdir_candidates:
+                            if not candidate:
+                                continue
+                            target_lower = candidate.lower().replace(" ", "_").replace("-", "_")
+                            for child in images_base.iterdir():
+                                if not child.is_dir():
+                                    continue
+                                if child.name.lower().replace(" ", "_").replace("-", "_") == target_lower:
+                                    for name in filename_variants:
+                                        sub_path = child / name
+                                        if sub_path.exists() and sub_path.is_file():
+                                            return FileResponse(str(sub_path))
+                                    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                        for stem in filename_no_ext_variants:
+                                            sub_path = child / f"{stem}{ext}"
+                                            if sub_path.exists() and sub_path.is_file():
+                                                return FileResponse(str(sub_path))
+                                    # Fallback: subdir exists but files may be named by number only (e.g. 252.jpg)
+                                    num_suffix = re.search(r"(\d+)$", filename_no_ext)
+                                    if num_suffix:
+                                        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                            sub_path = child / f"{num_suffix.group(1)}{ext}"
+                                            if sub_path.exists() and sub_path.is_file():
+                                                return FileResponse(str(sub_path))
+                            break  # only need first candidate for case-insensitive; then try literal
+                    except OSError:
+                        pass
+                    for subdir in subdir_candidates:
+                        if not subdir:
+                            continue
+                        species_dir = images_base / subdir
+                        for name in filename_variants:
+                            sub_path = species_dir / name
+                            if sub_path.exists() and sub_path.is_file():
+                                return FileResponse(str(sub_path))
+                        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                            for stem in filename_no_ext_variants:
+                                sub_path = species_dir / f"{stem}{ext}"
+                                if sub_path.exists() and sub_path.is_file():
+                                    return FileResponse(str(sub_path))
+                        # Fallback: try numeric suffix only in this subdir (e.g. wild_turkey/252.jpg)
+                        num_suffix = re.search(r"(\d+)$", filename_no_ext)
+                        if num_suffix:
+                            for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                sub_path = species_dir / f"{num_suffix.group(1)}{ext}"
+                                if sub_path.exists() and sub_path.is_file():
+                                    return FileResponse(str(sub_path))
                     return None
                 
                 def try_flat():
                     if flat_to_try.exists() and flat_to_try.is_file():
                         return FileResponse(str(flat_to_try))
+                    for name in filename_variants:
+                        flat_variant = images_base / name
+                        if flat_variant.exists() and flat_variant.is_file():
+                            return FileResponse(str(flat_variant))
                     return None
                 
-                print(f"🖼️  Looking for image: {filename}")
                 # Order: species subdir first when Taiga layout (subdirs only), else flat first
                 if IMAGES_TRY_SPECIES_FIRST:
                     r = try_species_subdir()
                     if r is not None:
-                        print(f"✅ Found image in species dir")
                         return r
-                    print(f"🖼️  Trying species subdir then flat: {image_path_flat_resolved}")
                     r = try_flat()
                     if r is not None:
-                        print(f"✅ Found image at: {flat_to_try}")
                         return r
                 else:
-                    print(f"🖼️  Full path (flat): {image_path_flat} -> resolved: {image_path_flat_resolved}")
                     r = try_flat()
                     if r is not None:
-                        print(f"✅ Found image at: {flat_to_try}")
                         return r
                     r = try_species_subdir()
                     if r is not None:
-                        print(f"✅ Found image in species dir")
                         return r
                 
                 # Case-insensitive in flat dir
                 filename_lower = filename.lower()
                 try:
-                    for item in images_dir.iterdir():
-                        if item.is_file() and item.name.lower() == filename_lower:
-                            print(f"✅ Found image (case-insensitive): {item.name}")
+                    for item in images_base.iterdir():
+                        if item.is_file() and item.name.lower() in {name.lower() for name in filename_variants}:
                             return FileResponse(str(item))
                 except OSError:
                     pass
                 
                 # 4) Different extensions in flat dir
                 for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
-                    potential_file = images_dir / f"{filename_no_ext}{ext}"
-                    if potential_file.exists() and potential_file.is_file():
-                        print(f"✅ Found image (other ext): {potential_file.name}")
-                        return FileResponse(str(potential_file))
+                    for stem in filename_no_ext_variants:
+                        potential_file = images_base / f"{stem}{ext}"
+                        if potential_file.exists() and potential_file.is_file():
+                            return FileResponse(str(potential_file))
                 
                 # Not found – log why (directory missing vs wrong filenames)
-                subdir = filename_no_ext.split("_")[0] if "_" in filename_no_ext else None
-                species_dir = images_dir / subdir if subdir else None
+                # Use same subdir list as try_species_subdir (e.g. wild_turkey then wild, same as domestic_cat then domestic)
+                if "_" in filename_no_ext:
+                    import re
+                    subdir_candidates_log = []
+                    if re.search(r"_\d+$", filename_no_ext):
+                        subdir_candidates_log.append(re.sub(r"_\d+$", "", filename_no_ext))
+                    elif "_" in filename_no_ext:
+                        subdir_candidates_log.append(filename_no_ext)
+                    subdir_candidates_log.append(filename_no_ext.split("_")[0])
+                    species_dirs_tried = [images_base / d for d in subdir_candidates_log]
+                else:
+                    species_dirs_tried = [images_base / filename_no_ext] if filename_no_ext else []
                 print(f"❌ Image not found: {filename}")
                 print(f"   Flat path resolved: {image_path_flat_resolved} (exists={image_path_flat_resolved.exists()})")
-                print(f"   Tried species subdir: {species_dir}")
-                if species_dir is not None:
-                    exists = species_dir.exists() and species_dir.is_dir()
-                    print(f"   Species dir exists: {exists}")
+                print(f"   Tried species subdirs: {species_dirs_tried}")
+                # Report first candidate we tried (e.g. wild_turkey, domestic_cat) not just first segment
+                if species_dirs_tried:
+                    first_tried = species_dirs_tried[0]
+                    exists = first_tried.exists() and first_tried.is_dir()
+                    print(f"   Species dir exists ({first_tried.name}): {exists}")
                     if exists:
                         try:
-                            sample = list(species_dir.iterdir())[:5]
+                            sample = list(first_tried.iterdir())[:5]
                             names = [p.name for p in sample if p.is_file()]
-                            print(f"   Sample files in {subdir}/: {names}")
+                            print(f"   Sample files in {first_tried.name}/: {names}")
                         except OSError as e:
-                            print(f"   (cannot list {subdir}/: {e})")
+                            print(f"   (cannot list {first_tried.name}/: {e})")
                     else:
                         try:
-                            resolved = species_dir.resolve()
-                            print(f"   Resolved path: {resolved}")
+                            print(f"   Resolved path: {first_tried.resolve()}")
                         except OSError as e:
                             print(f"   Resolve failed (permissions?): {e}")
                 print(f"   Tried flat: {image_path_flat}")
@@ -784,7 +898,7 @@ class WebInterface:
                 # List files with same prefix (e.g. grapes_*) to see if any exist
                 prefix = filename_no_ext.split("_")[0] if "_" in filename_no_ext else filename_no_ext
                 try:
-                    same_prefix = [p.name for p in images_dir.iterdir() if p.is_file() and p.name.lower().startswith(prefix.lower() + "_")]
+                    same_prefix = [p.name for p in images_base.iterdir() if p.is_file() and p.name.lower().startswith(prefix.lower() + "_")]
                     if same_prefix:
                         print(f"   Files with prefix '{prefix}_' in images dir: {same_prefix[:10]}{'...' if len(same_prefix) > 10 else ''}")
                     else:
@@ -796,7 +910,7 @@ class WebInterface:
                 similar_files = []
                 filename_lower_short = filename_lower[:10]
                 try:
-                    for item in images_dir.iterdir():
+                    for item in images_base.iterdir():
                         if item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png', '.gif']:
                             if filename_lower_short in item.name.lower() or item.name.lower().startswith(filename_lower_short):
                                 similar_files.append(item.name)
@@ -808,6 +922,12 @@ class WebInterface:
                 error_detail = f"Image not found: {filename}"
                 if similar_files:
                     error_detail += f". Similar files found: {', '.join(similar_files[:3])}"
+                
+                # Fallback: redirect to MCP server /images/ so images on the server (e.g. wild_turkey) still load
+                if getattr(self, "mcp_server_url", None):
+                    mcp_images_url = f"{self.mcp_server_url.rstrip('/')}/images/{filename}"
+                    print(f"🖼️  Redirecting to MCP server for image: {mcp_images_url}")
+                    return RedirectResponse(url=mcp_images_url, status_code=302)
                 
                 raise HTTPException(status_code=404, detail=error_detail)
                 
@@ -833,19 +953,37 @@ class WebInterface:
                     images_dir_resolved = images_dir.resolve()
                     image_path_flat_resolved = (images_dir_resolved / filename).resolve()
                 except OSError:
+                    images_dir_resolved = images_dir
                     image_path_flat_resolved = image_path_flat
                 disp = lambda n: f'attachment; filename="{n}"'
                 
                 print(f"📥 Download request for image: {filename}")
                 flat_to_try = image_path_flat_resolved if image_path_flat_resolved != image_path_flat else image_path_flat
+                images_base = images_dir_resolved
                 def _dl_species():
                     if "_" not in filename_no_ext:
                         return None
-                    subdir = filename_no_ext.split("_")[0]
-                    species_dir = images_dir / subdir
-                    for p in [species_dir / filename, *(species_dir / f"{filename_no_ext}{e}" for e in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF'])]:
-                        if p.exists() and p.is_file():
-                            return FileResponse(str(p), media_type="application/octet-stream", filename=p.name, headers={"Content-Disposition": disp(p.name)})
+                    import re
+                    subdir_candidates = []
+                    if re.search(r"_\d+$", filename_no_ext):
+                        subdir_candidates.append(re.sub(r"_\d+$", "", filename_no_ext))
+                    elif "_" in filename_no_ext:
+                        subdir_candidates.append(filename_no_ext)
+                    subdir_candidates.append(filename_no_ext.split("_")[0])
+                    for subdir in subdir_candidates:
+                        if not subdir:
+                            continue
+                        species_dir = images_base / subdir
+                        for p in [species_dir / filename, *(species_dir / f"{filename_no_ext}{e}" for e in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF'])]:
+                            if p.exists() and p.is_file():
+                                return FileResponse(str(p), media_type="application/octet-stream", filename=p.name, headers={"Content-Disposition": disp(p.name)})
+                        # Fallback: numeric suffix only (e.g. wild_turkey/252.jpg)
+                        num_suffix = re.search(r"(\d+)$", filename_no_ext)
+                        if num_suffix:
+                            for e in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                p = species_dir / f"{num_suffix.group(1)}{e}"
+                                if p.exists() and p.is_file():
+                                    return FileResponse(str(p), media_type="application/octet-stream", filename=p.name, headers={"Content-Disposition": disp(p.name)})
                     return None
                 if IMAGES_TRY_SPECIES_FIRST:
                     r = _dl_species()
@@ -860,13 +998,13 @@ class WebInterface:
                 # Case-insensitive, then other extensions in flat dir
                 filename_lower = filename.lower()
                 try:
-                    for item in images_dir.iterdir():
+                    for item in images_base.iterdir():
                         if item.is_file() and item.name.lower() == filename_lower:
                             return FileResponse(str(item), media_type="application/octet-stream", filename=item.name, headers={"Content-Disposition": disp(item.name)})
                 except OSError:
                     pass
                 for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
-                    potential_file = images_dir / f"{filename_no_ext}{ext}"
+                    potential_file = images_base / f"{filename_no_ext}{ext}"
                     if potential_file.exists() and potential_file.is_file():
                         return FileResponse(str(potential_file), media_type="application/octet-stream", filename=potential_file.name, headers={"Content-Disposition": disp(potential_file.name)})
                 
@@ -899,11 +1037,10 @@ class WebInterface:
         with open(search_template, "w") as f:
             f.write(self._get_search_template())
         
-        # Search results template
+        # Search results template (always regenerate for disclaimer footer)
         results_template = templates_dir / "search_results.html"
-        if not results_template.exists():
-            with open(results_template, "w") as f:
-                f.write(self._get_results_template())
+        with open(results_template, "w") as f:
+            f.write(self._get_results_template())
         
         # LLM search results template (always regenerate to ensure latest version)
         llm_results_template = templates_dir / "llm_search_results.html"
@@ -915,6 +1052,32 @@ class WebInterface:
         with open(croissant_template, "w") as f:
             f.write(self._get_croissant_datasets_template())
     
+    def _normalize_datasets_for_template(self, raw: Any) -> List[Dict[str, Any]]:
+        """Ensure datasets is a list of dicts with 'name' and 'type' for the dropdown (type used for category filter)."""
+        if isinstance(raw, list):
+            out = []
+            for d in raw:
+                name = (d.get("name") if isinstance(d, dict) else str(d)) or "unknown"
+                dtype = (d.get("type") if isinstance(d, dict) else None) or ""
+                if hasattr(dtype, "value"):
+                    dtype = dtype.value
+                out.append({"name": name, "type": str(dtype).strip().lower() if dtype else ""})
+            return out
+        if isinstance(raw, dict):
+            # API sometimes returns {"dataset_name": DatasetInfo or dict, ...}; extract type from value
+            out = []
+            for k, v in raw.items():
+                t = ""
+                if isinstance(v, dict):
+                    t = v.get("type") or ""
+                elif hasattr(v, "type"):
+                    t = getattr(v, "type", "")
+                if hasattr(t, "value"):
+                    t = t.value
+                out.append({"name": k, "type": str(t).strip().lower() if t else ""})
+            return out
+        return []
+
     def _extract_filters_from_datasets(self, datasets: List[Dict[str, Any]]) -> Dict[str, List[str]]:
         """Extract available filters from datasets"""
         all_filters = {
@@ -1044,6 +1207,70 @@ class WebInterface:
             traceback.print_exc()
             return "/images/placeholder.jpg"
     
+    def _get_site_footer_css(self) -> str:
+        """Shared footer styles for disclaimer and acknowledgments."""
+        return """
+        .site-footer { margin-top: 32px; padding-top: 20px; border-top: 1px solid #dee2e6; font-size: 13px; color: #444; line-height: 1.5; }
+        .site-footer summary { cursor: pointer; font-weight: bold; color: #1a1a1a; }
+        .disclaimer-box { background: #fff8e6; border: 1px solid #f0d58c; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; }
+        .disclaimer-box ul { margin: 8px 0 0 1.2em; padding: 0; }
+        .disclaimer-box li { margin-bottom: 4px; }
+        .resource-ack { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+        .resource-ack img, .resource-ack svg { height: 44px; width: auto; display: block; flex-shrink: 0; }
+        .resource-ack-body { flex: 1; min-width: 260px; font-size: 12px; color: #333; }
+        .resource-ack-body p { margin: 0 0 8px 0; }
+        .resource-ack-body ul { margin: 0; padding-left: 1.2em; }
+        .resource-ack-body li { margin-bottom: 4px; }
+        """
+
+    def _get_site_footer_html(self) -> str:
+        """Disclaimer + resource acknowledgments (species.aifarms.org)."""
+        return """
+        <footer class="site-footer">
+            <details class="disclaimer-box" open>
+                <summary>Data quality &amp; AI-generated metadata</summary>
+                <p>
+                    Image metadata in this catalog were produced in part by vision-language models
+                    (<a href="https://azure.microsoft.com/en-us/products/ai-services/openai-service" target="_blank" rel="noopener noreferrer">Azure OpenAI</a>
+                    <strong>GPT-4.1</strong> at time of ingest). They are intended for
+                    <strong>discovery and research support</strong>, not as verified ground truth.
+                </p>
+                <ul>
+                    <li><strong>Species / taxonomy:</strong> common and scientific names were post-processed and checked against curated lists.</li>
+                    <li><strong>Scene fields</strong> (description, time, weather, lighting, setting, background):
+                        model-generated and <strong>not manually verified</strong> for every image.</li>
+                    <li><strong>Agreement research:</strong> under strict multi-model rules, most free-text captions
+                        would require human review before automated publishing — that does not mean all other metadata
+                        is unusable, but thresholds for auto-trust are an active research question.</li>
+                    <li>Do not rely on this resource alone for species identification, pest management, or regulatory decisions.</li>
+                </ul>
+            </details>
+            <div class="resource-ack">
+                <a href="https://nairrpilot.org/" target="_blank" rel="noopener noreferrer" title="NAIRR Pilot" aria-label="NAIRR Pilot">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="220" height="48" viewBox="0 0 220 48" role="img" aria-hidden="true">
+                      <rect width="220" height="48" rx="6" fill="#1a4480"/>
+                      <text x="110" y="21" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700" text-anchor="middle">NAIRR Pilot</text>
+                      <text x="110" y="36" fill="#c7dafc" font-family="Arial, Helvetica, sans-serif" font-size="9" text-anchor="middle">National AI Research Resource</text>
+                    </svg>
+                </a>
+                <div class="resource-ack-body">
+                    <p><strong>Computational resources &amp; partners.</strong> AIFARMS acknowledges:</p>
+                    <ul>
+                        <li>The <a href="https://nairrpilot.org/" target="_blank" rel="noopener noreferrer">National Artificial Intelligence Research Resource (NAIRR) Pilot</a>
+                            and the Delta advanced computing and data resource (NSF award
+                            <a href="https://nairrpilot.org/about" target="_blank" rel="noopener noreferrer">OAC-2005572</a>).</li>
+                        <li><a href="https://www.cloudbank.org/" target="_blank" rel="noopener noreferrer">CloudBank</a>,
+                            which provides NSF-sponsored access to commercial cloud resources through ACCESS and the NAIRR Pilot.</li>
+                        <li><a href="https://azure.microsoft.com/en-us" target="_blank" rel="noopener noreferrer">Microsoft Azure</a>
+                            and Azure OpenAI for vision-language metadata generation and query understanding.</li>
+                        <li><a href="https://cloud.sambanova.ai/" target="_blank" rel="noopener noreferrer">SambaNova Cloud</a>
+                            for multi-model inference and comparison resources used in metadata evaluation.</li>
+                    </ul>
+                </div>
+            </div>
+        </footer>
+        """
+
     def _get_search_template(self) -> str:
         """Get the search interface HTML template"""
         return """
@@ -1058,9 +1285,11 @@ class WebInterface:
         .header { text-align: center; margin-bottom: 30px; }
         .search-form { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
         .form-row { display: flex; gap: 20px; margin-bottom: 15px; }
-        .form-group { flex: 1; }
-        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #333; }
-        .form-group select, .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .form-group { flex: 1; min-width: 0; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #1a1a1a; font-size: 14px; }
+        .form-group select, .form-group input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; background: #fff; color: #222; }
+        .form-group.form-group-dataset label { color: #1a1a1a; font-weight: bold; }
+        .form-group.form-group-dataset select { border-color: #ccc; background: #fff; color: #222; }
         .search-button { background: #007bff; color: white; padding: 12px 30px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
         .search-button:hover { background: #0056b3; }
         .mcp-info { background: #d4edda; padding: 15px; border-radius: 8px; margin: 20px 0; }
@@ -1074,6 +1303,7 @@ class WebInterface:
         .llm-examples h4 { margin-bottom: 10px; }
         .llm-examples ul { list-style: none; padding: 0; margin: 0; }
         .llm-examples li { margin-bottom: 5px; }
+        """ + self._get_site_footer_css() + """
     </style>
 </head>
 <body>
@@ -1093,7 +1323,8 @@ class WebInterface:
         <div class="mcp-info">
             <h3>🤖 MCP Server Integration</h3>
             <p>This interface connects to the AIFARMS MCP Server at <code>{{ mcp_server_url }}</code></p>
-            <p><strong>Available Datasets:</strong> {{ datasets|length }} datasets loaded</p>
+            <p><strong>How to search:</strong> You can type a natural language query (e.g. “coyote at night”) to search for a species, or choose a <strong>Category</strong> and <strong>Dataset</strong> from the dropdowns below and run the search to browse that dataset. Leave the query blank to see all images from the selected dataset.</p>
+            <p><strong>Available Datasets:</strong> {{ datasets|length }} total</p>
             <p><strong>Features:</strong> AI-powered semantic search, ML model inference, extensible tools</p>
         </div>
             
@@ -1106,28 +1337,42 @@ class WebInterface:
                 <div class="form-row">
                     <div class="form-group">
                         <label for="llm_query">Natural Language Query:</label>
-                        <input type="text" id="llm_query" name="query" placeholder="e.g., 'coyote at night' or 'unripe raspberries'" required>
+                        <input type="text" id="llm_query" name="query" placeholder="e.g., 'coyote at night' or leave blank to show all images from the selected dataset">
                     </div>
                 </div>
                 
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="llm_dataset">Dataset (optional):</label>
-                        <select id="llm_dataset" name="dataset">
+                        <label for="llm_category">Category (optional):</label>
+                        <select id="llm_category" name="category">
+                            <option value="">All categories</option>
+                            <option value="wildlife">Wildlife</option>
+                            <option value="domestic_animal">Domestic animal</option>
+                            <option value="livestock">Livestock</option>
+                            <option value="plants">Plants</option>
+                            <option value="pests">Pests</option>
+                            <option value="animal">Animal (all types)</option>
+                        </select>
+                    </div>
+                    <div class="form-group form-group-dataset">
+                        <label for="llm_dataset">Dataset (optional)</label>
+                        <select id="llm_dataset" name="dataset" title="Restrict search to a specific dataset (filtered by category when set)">
                             <option value="">All datasets</option>
+                            <option value="" disabled class="no-match-msg" style="display: none;">(no datasets in this category)</option>
                             {% for dataset in datasets %}
-                            <option value="{{ dataset.name }}">{{ dataset.name|title }}</option>
+                            <option value="{{ dataset.name }}" data-type="{{ dataset.type|default('') }}">{{ dataset.name|title }}</option>
+                            {% else %}
+                            <option value="" disabled>(no datasets loaded — check MCP server)</option>
                             {% endfor %}
                         </select>
                     </div>
                     
                     <div class="form-group">
-                        <label for="llm_limit">Results per page:</label>
+                        <label for="llm_limit">Results per page (max 50):</label>
                         <select id="llm_limit" name="limit">
                             <option value="10">10</option>
-                            <option value="20" selected>20</option>
-                            <option value="50">50</option>
-                            <option value="100">100</option>
+                            <option value="20">20</option>
+                            <option value="50" selected>50</option>
                         </select>
                     </div>
                     
@@ -1155,7 +1400,71 @@ class WebInterface:
                 </div>
             </div>
         </div>
+        """ + self._get_site_footer_html() + """
     </div>
+    <script>
+    (function() {
+        var catSelect = document.getElementById('llm_category');
+        var dsSelect = document.getElementById('llm_dataset');
+        if (!catSelect || !dsSelect) return;
+        // Infer type from dataset name (mirrors server); livestock/domestic use exact names only
+        function inferTypeFromName(name) {
+            if (!name) return 'pests';
+            var n = name.toLowerCase().replace(/-/g, '_').replace(/[ \t\n]+/g, '_').trim();
+            // Blocklist: never treat as wildlife (pest species)
+            if (n === 'stictocephala_bisonia' || n === 'stictocephala_diceros') return 'pests';
+            // Domestic animal: only these exact names
+            if (n === 'dog' || n === 'domestic_cat') return 'domestic_animal';
+            // Livestock: only these exact names
+            if (n === 'goat' || n === 'goat_2' || n === 'chicken') return 'livestock';
+            // Wildlife: exact allowlist only
+            var wildlife = ['american_black_bear','american_crow','bird','bobcat','coyote','eastern_chipmunk','eastern_cottontail','eastern_fox_squirrel','eaestern_gray_squirrel','grey_fox','horse','northern_raccoon','red_fox','striped_skunk','virginia_oppossum','white_tailed_deer','wild_turkey','woodchuck'];
+            if (wildlife.indexOf(n) !== -1) return 'wildlife';
+            // Plants: exact allowlist only
+            var plants = ['almonds','apple','avocado','beets','blueberry','broccoli','capsicum','carrots','celery','citrus','grapes','green_cabbage','iceberg','mango_1','mango_2','orange','raspberry','red_leaf_5_6','red_leaf_8_9','rockmelon','romaine','strawberry_1','strawberry_2','strawberry_3','tomatoes'];
+            if (plants.indexOf(n) !== -1) return 'plants';
+            // Everything else is pests (3000+ pest datasets)
+            return 'pests';
+        }
+        function filterDatasetsByCategory() {
+            var category = (catSelect.value || '').toLowerCase();
+            var animalTypes = ['wildlife', 'domestic_animal', 'livestock'];
+            var matchCount = 0;
+            for (var i = 0; i < dsSelect.options.length; i++) {
+                var opt = dsSelect.options[i];
+                if (opt.value === '' && !opt.classList.contains('no-match-msg')) { opt.style.display = ''; opt.disabled = false; continue; }
+                if (opt.classList.contains('no-match-msg')) { opt.style.display = 'none'; continue; }
+                var dtype = (opt.getAttribute('data-type') || '').toLowerCase();
+                if (dtype === '' || dtype === 'unknown') dtype = inferTypeFromName(opt.value);
+                var show = true;
+                if (category === '') show = true;
+                else if (category === 'animal') show = animalTypes.indexOf(dtype) !== -1;
+                else show = dtype === category;
+                if (show) matchCount++;
+                opt.style.display = show ? '' : 'none';
+                opt.disabled = !show;
+            }
+            var noMatchOpt = dsSelect.querySelector('option.no-match-msg');
+            if (noMatchOpt) {
+                noMatchOpt.style.display = (category !== '' && matchCount === 0) ? '' : 'none';
+                noMatchOpt.disabled = true;
+            }
+            var firstShown = null;
+            for (var j = 0; j < dsSelect.options.length; j++) {
+                if (dsSelect.options[j].classList.contains('no-match-msg')) continue;
+                if (dsSelect.options[j].value === '' || dsSelect.options[j].style.display !== 'none') {
+                    firstShown = dsSelect.options[j];
+                    break;
+                }
+            }
+            if (dsSelect.value && dsSelect.selectedOptions.length && dsSelect.selectedOptions[0].style.display === 'none') {
+                dsSelect.value = firstShown ? firstShown.value : '';
+            }
+        }
+        catSelect.addEventListener('change', filterDatasetsByCategory);
+        filterDatasetsByCategory();
+    })();
+    </script>
 </body>
 </html>
 """
@@ -1181,6 +1490,7 @@ class WebInterface:
         .download-button { display: inline-block; margin-top: 10px; padding: 8px 16px; background: #007bff; color: white; text-decoration: none; border-radius: 4px; font-size: 14px; }
         .download-button:hover { background: #0056b3; }
         .no-results { text-align: center; padding: 40px; color: #666; }
+        """ + self._get_site_footer_css() + """
     </style>
 </head>
 <body>
@@ -1198,7 +1508,7 @@ class WebInterface:
         {% elif results.results %}
         <div class="results-info">
             <p><strong>Query:</strong> {{ query or "All images" }}</p>
-            <p><strong>Total results:</strong> {{ results.total_count or results.results|length }}</p>
+            <p><strong>Showing {{ results.results|length }} of {{ results.total_count or results.results|length }} results</strong> — use the buttons below to load more.</p>
             <p><strong>Page:</strong> {{ current_page }} of {{ (results.total_count / limit)|round(0, 'ceil')|int if results.total_count else 1 }}</p>
         </div>
         
@@ -1266,6 +1576,7 @@ class WebInterface:
             <p>Results structure: {{ results }}</p>
         </div>
         {% endif %}
+        """ + self._get_site_footer_html() + """
     </div>
 </body>
 </html>
@@ -1296,6 +1607,7 @@ class WebInterface:
         .confidence-badge { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.8); color: white; padding: 5px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
         .metadata { margin-top: 10px; font-size: 14px; }
         .no-results { text-align: center; padding: 40px; color: #666; }
+        """ + self._get_site_footer_css() + """
     </style>
 </head>
 <body>
@@ -1411,6 +1723,7 @@ class WebInterface:
             <form method="post" action="/llm_search" style="display: inline;">
                 <input type="hidden" name="query" value="{{ query }}">
                 <input type="hidden" name="dataset" value="{{ dataset or '' }}">
+                <input type="hidden" name="category" value="{{ category or '' }}">
                 <input type="hidden" name="limit" value="{{ limit }}">
                 <input type="hidden" name="page" value="1">
                 <input type="hidden" name="dataset_offset" value="{{ next_dataset_offset }}">
@@ -1429,6 +1742,7 @@ class WebInterface:
                 <form method="post" action="/llm_search" style="display: inline;">
                     <input type="hidden" name="query" value="{{ query }}">
                     <input type="hidden" name="dataset" value="{{ dataset or '' }}">
+                    <input type="hidden" name="category" value="{{ category or '' }}">
                     <input type="hidden" name="limit" value="{{ limit }}">
                     <input type="hidden" name="page" value="{{ current_page - 1 }}">
                     <input type="hidden" name="dataset_offset" value="{{ dataset_offset }}">
@@ -1443,6 +1757,7 @@ class WebInterface:
                     <form method="post" action="/llm_search" style="display: inline;">
                         <input type="hidden" name="query" value="{{ query }}">
                         <input type="hidden" name="dataset" value="{{ dataset or '' }}">
+                        <input type="hidden" name="category" value="{{ category or '' }}">
                         <input type="hidden" name="limit" value="{{ limit }}">
                         <input type="hidden" name="page" value="{{ page_num }}">
                         <input type="hidden" name="dataset_offset" value="{{ dataset_offset }}">
@@ -1457,6 +1772,7 @@ class WebInterface:
                 <form method="post" action="/llm_search" style="display: inline;">
                     <input type="hidden" name="query" value="{{ query }}">
                     <input type="hidden" name="dataset" value="{{ dataset or '' }}">
+                    <input type="hidden" name="category" value="{{ category or '' }}">
                     <input type="hidden" name="limit" value="{{ limit }}">
                     <input type="hidden" name="page" value="{{ current_page + 1 }}">
                     <input type="hidden" name="dataset_offset" value="{{ dataset_offset }}">
@@ -1475,6 +1791,7 @@ class WebInterface:
             <p>Results structure: {{ results }}</p>
         </div>
         {% endif %}
+        """ + self._get_site_footer_html() + """
     </div>
 </body>
 </html>
@@ -1500,6 +1817,7 @@ class WebInterface:
         .field-tag { display: inline-block; background: #e9ecef; padding: 2px 8px; margin: 2px; border-radius: 12px; font-size: 12px; }
         .source-badge { background: #28a745; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
         .no-results { text-align: center; padding: 40px; color: #666; }
+        """ + self._get_site_footer_css() + """
     </style>
 </head>
 <body>
@@ -1561,6 +1879,7 @@ class WebInterface:
             <p><strong>Debug:</strong> datasets variable is {{ datasets }}, length is {{ datasets|length if datasets else 0 }}</p>
         </div>
         {% endif %}
+        """ + self._get_site_footer_html() + """
     </div>
 </body>
 </html>"""
@@ -1572,8 +1891,10 @@ class WebInterface:
         
         print(f"🌐 Starting Web Interface on {host}:{port}")
         print(f"🔗 MCP Server: {self.mcp_server_url}")
-        print(f"📱 Web Interface: http://{host}:{port}")
-        print(f"🔍 Search: http://{host}:{port}/")
+        print(f"📱 Open in browser: http://localhost:{port}  or  http://127.0.0.1:{port}")
+        if host == "0.0.0.0":
+            print(f"   (From another machine use: http://<this-machine-ip>:{port})")
+        print(f"🔍 Search: http://localhost:{port}/")
         
         uvicorn.run(self.app, host=host, port=port)
 
