@@ -110,6 +110,13 @@ PLUGINS_DIR = BASE_DIR / "plugins"
 DATASETS_DIR = BASE_DIR / "datasets"
 # Directory for MCP JSON data files (discovery uses BASE_DIR by default; can override with MCP_JSON_DIR env)
 MCP_JSON_DIR = Path(os.getenv("MCP_JSON_DIR", str(BASE_DIR)))
+# Optional: comma-separated extra dirs to search for *_mcp_data.json
+# Example (pest subfolder): MCP_JSON_EXTRA_DIRS=/opt/mcp-data-server/mcp_json/-1423391161
+# Example (wildlife/plants/domestic/livestock): add the dir where those JSONs live so they load and appear under Wildlife/Plants etc. in the UI:
+#   MCP_JSON_EXTRA_DIRS=/path/to/animals_plants
+# Or use a single env with multiple paths: MCP_JSON_EXTRA_DIRS=/path/to/mcp_json,/path/to/animals_plants
+_env_extra = os.getenv("MCP_JSON_EXTRA_DIRS", "").strip()
+MCP_JSON_EXTRA_DIRS = [Path(p.strip()) for p in _env_extra.split(",") if p.strip()] if _env_extra else []
 
 # LLM Configuration
 # Supports: Azure OpenAI, OpenAI, and Gemini
@@ -119,6 +126,7 @@ LLM_CONFIG = {
     "api_key": os.getenv("OPENAI_API_KEY", ""),  # OpenAI API key (also used as fallback key for Azure)
     "model": os.getenv("LLM_MODEL", "gpt-5-mini-2"),  # Model/deployment name (OpenAI model or Azure deployment)
     "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    "provider": os.getenv("LLM_PROVIDER", "auto").lower(),  # "openai", "gemini", or "auto" (auto prefers OpenAI first)
     "enabled": os.getenv("LLM_ENABLED", "true").lower() == "true",
     "fallback_to_rules": os.getenv("LLM_FALLBACK_TO_RULES", "true").lower() == "true",
     # Azure OpenAI (optional; if set, used for OpenAI-compatible calls)
@@ -138,7 +146,7 @@ MCP_CONFIG = {
 WEB_CONFIG = {
     "web_host": os.getenv("WEB_HOST", "0.0.0.0"),
     "web_port": int(os.getenv("WEB_PORT", 8187)),
-    "mcp_server_url": os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8188")
+    "mcp_server_url": os.getenv("MCP_SERVER_URL", "https://mcp.aifarms.org/")
 }
 
 # Dataset configuration
@@ -160,6 +168,8 @@ SPECIES_SCIENTIFIC_NAMES = {
     "strawberry_2": "Fragaria × ananassa",
     "strawberry_3": "Fragaria × ananassa",
     "blueberry": "Vaccinium sect. Cyanococcus",
+    "carrot": "Daucus carota",
+    "celery": "Apium graveolens",
     "red_leaf": "Acer rubrum",
     "romaine": "Lactuca sativa var. longifolia",
     "tomatoes": "Solanum lycopersicum",

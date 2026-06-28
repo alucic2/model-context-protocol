@@ -7,6 +7,7 @@ Core MCP Server
 """
 
 import json
+import re
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable, Union
@@ -23,6 +24,130 @@ def _metadata_str(val: Any) -> str:
     return str(val)
 
 
+def _canonical_time_from_text(time_text: str) -> set:
+    """Map raw time metadata to canonical buckets used by the LLM and search filters."""
+    if not time_text:
+        return set()
+    time_info = str(time_text).lower()
+    buckets = set()
+    if "night" in time_info or "dark" in time_info:
+        buckets.add("night")
+    if "day" in time_info or "morning" in time_info or "afternoon" in time_info:
+        buckets.add("day")
+    if "dawn" in time_info or "sunrise" in time_info:
+        buckets.add("dawn")
+    if "dusk" in time_info or "sunset" in time_info:
+        buckets.add("dusk")
+    if "evening" in time_info or "twilight" in time_info or "late afternoon" in time_info:
+        buckets.add("evening")
+    return buckets
+
+
+_TIME_QUERY_PHRASES = {
+    "night": ("at night", "nighttime", "night time", "during night", "nocturnal"),
+    "day": ("daytime", "day time", "during day", "in daylight"),
+    "dawn": ("at dawn", "sunrise"),
+    "dusk": ("at dusk", "sunset"),
+    "evening": ("evening", "twilight", "late afternoon"),
+}
+
+
+# Common-name synonyms → a term that appears in our dataset names. Lets queries like "groundhog" resolve to
+# the "woodchuck" dataset (and not be flagged as "not in catalog"). Keys are lowercase; values are matched
+# as a segment/substring of dataset names.
+_SPECIES_SYNONYMS = {
+    "groundhog": "woodchuck",
+    "groundhogs": "woodchuck",
+    "whistlepig": "woodchuck",
+    "whistle-pig": "woodchuck",
+    "possum": "opossum",
+    "possums": "opossum",
+    "rabbit": "cottontail",
+    "rabbits": "cottontail",
+    "bunny": "cottontail",
+    "bunnies": "cottontail",
+    "raccoon": "raccoon",
+    "racoon": "raccoon",
+    "buck": "deer",
+    "doe": "deer",
+    "fawn": "deer",
+}
+
+# Generic insect/pest group words. These are too broad to index as a specific common name (a single one
+# would map to thousands of datasets), so the common-name index skips them when they appear alone.
+_PEST_TYPE_WORDS_SET = {
+    "beetle", "beetles", "butterfly", "butterflies", "moth", "moths", "wasp", "wasps",
+    "bee", "bees", "ant", "ants", "fly", "flies", "grasshopper", "grasshoppers",
+    "dragonfly", "dragonflies", "spider", "spiders", "bug", "bugs", "insect", "insects",
+    "weevil", "weevils", "aphid", "aphids", "caterpillar", "caterpillars", "midge", "midges",
+}
+
+# User-facing pest common-name aliases that may not be present literally in metadata.
+# These are expanded only for common-name lookup, so they do not broaden generic pest-type searches.
+_COMMON_NAME_QUERY_ALIASES = {
+    "ladybug": ("lady beetle", "ladybird beetle", "ladybird"),
+    "ladybugs": ("lady beetle", "lady beetles", "ladybird beetles", "ladybirds"),
+    "lady bug": ("lady beetle", "ladybird beetle"),
+    "lady bugs": ("lady beetles", "ladybird beetles"),
+    "ladybird": ("lady beetle", "ladybird beetle"),
+    "ladybirds": ("lady beetles", "ladybird beetles"),
+}
+
+
+# Map behavior words in a query to a canonical action value. Used to inject an action filter when the
+# LLM omits one, so e.g. "squirrel eating" filters via the synonym-aware action matcher (eating→foraging)
+# instead of requiring the literal word "eating" in the description.
+_ACTION_QUERY_MAP = {
+    "foraging": ("eating", "eat", "feeding", "feed", "foraging", "forage", "grazing", "graze", "nibbling", "nibble"),
+    "sleeping": ("sleeping", "sleep", "resting", "rest"),
+    "walking": ("walking", "walk", "moving", "move"),
+    "running": ("running", "run"),
+    "standing": ("standing", "stand"),
+    "sitting": ("sitting", "sit"),
+    "alert": ("alert", "looking", "staring", "facing", "watching", "watch"),
+    "hunting": ("hunting", "hunt"),
+    "flying": ("flying", "fly"),
+    "perching": ("perching", "perch", "perched"),
+    "drinking": ("drinking", "drink"),
+    "climbing": ("climbing", "climb"),
+    "jumping": ("jumping", "jump"),
+    "swimming": ("swimming", "swim"),
+}
+
+
+# Words that describe an attribute/behavior/setting rather than a species subject.
+# Used to tell "unknown species" queries (e.g. "hedgehog standing") apart from
+# attribute-only queries (e.g. "sleeping at night") so we can return a clear message.
+_NON_SUBJECT_WORDS = {
+    # actions / behavior
+    "walking", "walk", "standing", "stand", "sitting", "sit", "eating", "eat", "feeding", "feed",
+    "foraging", "forage", "sleeping", "sleep", "resting", "rest", "running", "run", "moving", "move",
+    "hunting", "hunt", "alert", "perching", "perch", "flying", "fly", "watching", "watch",
+    "looking", "look", "staring", "stare", "facing", "face", "grazing", "graze", "drinking", "drink",
+    "jumping", "jump", "climbing", "climb", "swimming", "swim", "lying", "crouching", "playing", "play",
+    "posing", "pose",
+    # time
+    "day", "night", "dawn", "dusk", "evening", "morning", "afternoon", "daytime", "nighttime",
+    "twilight", "sunrise", "sunset", "noon", "midnight", "nocturnal",
+    # season
+    "spring", "summer", "fall", "autumn", "winter",
+    # scene / setting
+    "field", "forest", "water", "mountain", "garden", "farm", "meadow", "indoor", "outdoor", "tree",
+    "trees", "snow", "grass", "road", "sky", "barn", "pen", "enclosure", "cage", "bush", "leaves",
+    "foliage", "background",
+    # plant state / descriptors
+    "ripe", "unripe", "mature", "immature", "blooming", "flowering", "fruiting", "green", "red",
+    "edible", "ready",
+    # generic group / category terms (let these fall through to category browse / all-search, not "unknown species")
+    "animal", "animals", "wildlife", "creature", "creatures", "species", "pest", "pests", "plant",
+    "plants", "crop", "crops", "livestock", "fruit", "fruits", "vegetable", "vegetables", "insect", "insects",
+    # generic / stopwords
+    "the", "and", "for", "with", "from", "near", "during", "under", "over", "image", "images",
+    "picture", "pictures", "photo", "photos", "show", "showing", "find", "finding", "search", "some",
+    "any", "all", "that", "this", "are", "being", "taken", "captured", "camera", "trail",
+}
+
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,16 +158,26 @@ import os
 from models import SearchRequest, SearchResponse, InferenceRequest, InferenceResult, DatasetType
 from tool_registry import ToolRegistry
 from dataset_registry import DatasetRegistry, Dataset
+from dataset_adapter import _item_canonical_action, _action_filter_conflicts, _description_indicates_awake_or_observing, _description_has_ripe_phrase
 from model_registry import ModelRegistry
 from config import MCP_CONFIG, MCP_PROTOCOL_CONFIG, BASE_DIR, LLM_CONFIG, IMAGES_DIR, IMAGES_TRY_SPECIES_FIRST
 
 # Optional imports
 try:
-    from llm_service import LLMService
+    from llm_service import LLMService, QueryUnderstanding
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
     LLMService = None
+    from dataclasses import dataclass, field
+    @dataclass
+    class QueryUnderstanding:
+        intent: str = ""
+        entities: List = field(default_factory=list)
+        filters: Dict = field(default_factory=dict)
+        confidence: float = 0.0
+        reasoning: str = ""
+        description_query: Optional[str] = None
 
 # IMPORTANT: This import happens at module load time
 # Make sure croissant_crawler.py is in the same directory as this file
@@ -119,6 +254,9 @@ class MCPServer:
         
         print("📁 Initializing dataset registry...")
         self.dataset_registry = DatasetRegistry()
+        # Lazily-built index mapping a common-name phrase (e.g. "painted lady") → dataset names
+        # (e.g. ["Vanessa_cardui"]) so common-name queries resolve to scientific-name datasets.
+        self._common_name_index: Optional[Dict[str, List[str]]] = None
         
         print("🤖 Initializing model registry...")
         self.model_registry = ModelRegistry()
@@ -143,6 +281,7 @@ class MCPServer:
             self.llm_service = LLMService(
                 api_key=LLM_CONFIG.get("api_key"),
                 model=LLM_CONFIG.get("model"),
+                provider=LLM_CONFIG.get("provider", "auto"),
                 azure_endpoint=LLM_CONFIG.get("azure_endpoint") or None,
                 azure_api_key=LLM_CONFIG.get("azure_api_key") or None,
                 azure_deployment=LLM_CONFIG.get("azure_deployment") or None,
@@ -191,6 +330,7 @@ class MCPServer:
                 "status": "healthy",
                 "server": self.name,
                 "version": self.version,
+                "raspberry_full_results": True,  # Present only in build that returns all raspberry images for "raspberries" query
                 "datasets_loaded": len(self.dataset_registry.datasets),
                 "tools_available": len(self.tool_registry.get_all_tools()),
                 "models_available": len(self.model_registry.get_all_models())
@@ -349,24 +489,83 @@ class MCPServer:
                     images_dir_resolved = images_dir.resolve()
                     image_path_flat_resolved = (images_dir_resolved / filename).resolve()
                 except OSError:
+                    images_dir_resolved = images_dir
                     image_path_flat_resolved = image_path_flat
                 flat_to_try = image_path_flat_resolved if image_path_flat_resolved != image_path_flat else image_path_flat
+                images_base = images_dir_resolved
                 
                 def _try_species():
                     if "_" not in filename_no_ext:
                         return None
-                    subdir = filename_no_ext.split("_")[0]
-                    species_dir = images_dir / subdir
-                    sub_path = species_dir / filename
-                    if sub_path.exists() and sub_path.is_file():
-                        return FileResponse(str(sub_path))
-                    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
-                        sub_path = species_dir / f"{filename_no_ext}{ext}"
+                    # Try dataset-name subdir first (e.g. domestic_cat for domestic_cat_001), then first segment
+                    import re
+                    subdir_candidates = []
+                    if re.search(r"_\d+$", filename_no_ext):
+                        subdir_candidates.append(re.sub(r"_\d+$", "", filename_no_ext))  # wild_turkey_001 -> wild_turkey
+                    elif "_" in filename_no_ext:
+                        subdir_candidates.append(filename_no_ext)  # wild_turkey (no number) -> wild_turkey
+                    subdir_candidates.append(filename_no_ext.split("_")[0])
+                    # Case-insensitive subdir match first (e.g. dir is Daktulosphaira_vitifoliae, we have daktulosphaira_vitifoliae)
+                    try:
+                        for candidate in subdir_candidates:
+                            if not candidate:
+                                continue
+                            target_lower = candidate.lower().replace(" ", "_")
+                            for child in images_base.iterdir():  # fresh list, not cache, so we see actual dirs
+                                if not child.is_dir():
+                                    continue
+                                if child.name.lower().replace(" ", "_") == target_lower:
+                                    sub_path = child / filename
+                                    if sub_path.exists() and sub_path.is_file():
+                                        return FileResponse(str(sub_path))
+                                    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                        sub_path = child / f"{filename_no_ext}{ext}"
+                                        if sub_path.exists() and sub_path.is_file():
+                                            return FileResponse(str(sub_path))
+                                    # Prefixed filename (e.g. goat_Luzignan-20160310_140237): try without prefix in subdir (goat/Luzignan-20160310_140237.jpg)
+                                    if filename_no_ext.startswith(candidate + "_"):
+                                        suffix = filename_no_ext[len(candidate) + 1:]
+                                        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                            sub_path = child / f"{suffix}{ext}"
+                                            if sub_path.exists() and sub_path.is_file():
+                                                return FileResponse(str(sub_path))
+                                    # Fallback: try numeric suffix only (e.g. wild_turkey/252.jpg)
+                                    num_suffix = re.search(r"(\d+)$", filename_no_ext)
+                                    if num_suffix:
+                                        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                            sub_path = child / f"{num_suffix.group(1)}{ext}"
+                                            if sub_path.exists() and sub_path.is_file():
+                                                return FileResponse(str(sub_path))
+                            break
+                    except Exception:
+                        pass
+                    for subdir in subdir_candidates:
+                        if not subdir:
+                            continue
+                        species_dir = images_base / subdir
+                        sub_path = species_dir / filename
                         if sub_path.exists() and sub_path.is_file():
                             return FileResponse(str(sub_path))
+                        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                            sub_path = species_dir / f"{filename_no_ext}{ext}"
+                            if sub_path.exists() and sub_path.is_file():
+                                return FileResponse(str(sub_path))
+                        # Prefixed filename (e.g. goat_Luzignan-...): try without prefix in this subdir
+                        if "_" in filename_no_ext and filename_no_ext.startswith(subdir + "_"):
+                            suffix = filename_no_ext[len(subdir) + 1:]
+                            for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                sub_path = species_dir / f"{suffix}{ext}"
+                                if sub_path.exists() and sub_path.is_file():
+                                    return FileResponse(str(sub_path))
+                        # Fallback: try numeric suffix only in this subdir (e.g. wild_turkey/252.jpg)
+                        num_suffix = re.search(r"(\d+)$", filename_no_ext)
+                        if num_suffix:
+                            for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
+                                sub_path = species_dir / f"{num_suffix.group(1)}{ext}"
+                                if sub_path.exists() and sub_path.is_file():
+                                    return FileResponse(str(sub_path))
                     return None
                 
-                print(f"🖼️  MCP Server: Looking for image: {filename}")
                 if IMAGES_TRY_SPECIES_FIRST:
                     r = _try_species()
                     if r is not None:
@@ -380,12 +579,12 @@ class MCPServer:
                     if r is not None:
                         return r
                 filename_lower = filename.lower()
-                dir_listing = _get_cached_dir_listing(images_dir)
+                dir_listing = _get_cached_dir_listing(images_base)
                 for item in dir_listing:
                     if item.is_file() and item.name.lower() == filename_lower:
                         return FileResponse(str(item))
                 for ext in ['.jpg', '.jpeg', '.png', '.gif', '.JPG', '.JPEG', '.PNG', '.GIF']:
-                    potential_file = images_dir / f"{filename_no_ext}{ext}"
+                    potential_file = images_base / f"{filename_no_ext}{ext}"
                     if potential_file.exists() and potential_file.is_file():
                         return FileResponse(str(potential_file))
                 
@@ -393,7 +592,7 @@ class MCPServer:
                 print(f"   Flat path resolved: {image_path_flat_resolved} (exists={image_path_flat_resolved.exists()})")
                 prefix = filename_no_ext.split("_")[0] if "_" in filename_no_ext else filename_no_ext
                 try:
-                    same_prefix = [p.name for p in _get_cached_dir_listing(images_dir) if p.is_file() and p.name.lower().startswith(prefix.lower() + "_")]
+                    same_prefix = [p.name for p in _get_cached_dir_listing(images_base) if p.is_file() and p.name.lower().startswith(prefix.lower() + "_")]
                     if same_prefix:
                         print(f"   Files with prefix '{prefix}_': {same_prefix[:10]}{'...' if len(same_prefix) > 10 else ''}")
                     else:
@@ -426,15 +625,7 @@ class MCPServer:
                 raise HTTPException(status_code=404, detail=f"Resource {resource_name} not found")
             return resources[resource_name]
         
-        # Dataset API
-        @self.app.get("/api/datasets")
-        async def list_datasets():
-            """List all available datasets"""
-            return {
-                "datasets": self.dataset_registry.get_all_datasets(),
-                "total": len(self.dataset_registry.get_all_datasets())
-            }
-        
+        # Dataset API - single list endpoint so UI gets name + type for each dataset
         @self.app.get("/api/datasets/{dataset_name}")
         async def get_dataset(dataset_name: str):
             """Get specific dataset information"""
@@ -534,25 +725,53 @@ class MCPServer:
         # Datasets API
         @self.app.get("/api/datasets")
         async def get_datasets():
-            """Get all available datasets"""
+            """Get all available datasets (all mcp_json names so UI dropdown is complete)."""
             try:
                 datasets = []
+                seen = set()
                 for dataset_name, dataset in self.dataset_registry.datasets.items():
-                    # Get images from the registry instead of accessing dataset.images
+                    seen.add(dataset_name)
                     images = self.dataset_registry.get_images(dataset_name)
                     dataset_info = {
                         "name": dataset_name,
                         "description": dataset.description,
-                        "type": dataset.dataset_type.value,
+                        "type": dataset.type.value,
                         "image_count": len(images),
-                        "collections": list(dataset.collections.keys()),
+                        "collections": list(dataset.collections) if isinstance(dataset.collections, list) else list(dataset.collections.keys()),
                         "filters": self._extract_dataset_filters(dataset)
                     }
                     datasets.append(dataset_info)
-                
+                # Include all names from mcp_json filenames so dropdown lists every possible dataset
+                for name in self.dataset_registry.get_all_mcp_dataset_names():
+                    if name not in seen:
+                        seen.add(name)
+                        # Infer type from name so category filter works even when dataset didn't load
+                        inferred = self.dataset_registry.infer_type_from_name(name)
+                        datasets.append({
+                            "name": name,
+                            "description": "(dataset not loaded)",
+                            "type": inferred,
+                            "image_count": 0,
+                            "collections": [],
+                            "filters": {}
+                        })
+                datasets.sort(key=lambda d: (d["name"].lower(), d["name"]))
                 return {"datasets": datasets}
             except Exception as e:
                 print(f"❌ Error getting datasets: {e}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.post("/api/reload-datasets")
+        async def reload_datasets():
+            """Reload dataset registry from disk (re-read MCP JSON files). Use after updating JSON. Code changes require server restart."""
+            try:
+                out = self.dataset_registry.reload_datasets()
+                print(f"🔄 Reloaded datasets: {out.get('datasets_loaded', 0)}")
+                return out
+            except Exception as e:
+                print(f"❌ Error reloading datasets: {e}")
                 import traceback
                 traceback.print_exc()
                 raise HTTPException(status_code=500, detail=str(e))
@@ -661,9 +880,10 @@ class MCPServer:
                 "properties": {
                     "query": {"type": "string", "description": "Natural language search query"},
                     "dataset": {"type": "string", "description": "Specific dataset to search in"},
-                    "limit": {"type": "integer", "default": 50},
+                    "category": {"type": "array", "items": {"type": "string"}, "description": "Restrict to data type: wildlife, domestic_animal, livestock, plants, pests, or animal"},
+                    "limit": {"type": "integer", "default": 50, "description": "Max results per page (capped at 50 for performance)"},
                     "offset": {"type": "integer", "default": 0},
-                    "dataset_offset": {"type": "integer", "default": 0, "description": "Skip this many datasets to load next batch (e.g. 100 for next 100)"}
+                    "dataset_offset": {"type": "integer", "default": 0, "description": "Skip this many datasets to load next batch"}
                 }
             },
             handler=self._llm_search_handler,
@@ -775,11 +995,14 @@ class MCPServer:
                 print(f"🔍 Category pre-filtering: {category_filter}")
                 for dataset_name, dataset_obj in self.dataset_registry.datasets.items():
                     dataset_category = dataset_obj.type.value.lower()
-                    # Map category filter to dataset type
+                    # Map category filter to dataset type (animal = wildlife + domestic + livestock)
                     category_mapping = {
                         "pest": ["pests"],
-                        "animal": ["wildlife"],
+                        "animal": ["wildlife", "domestic_animal", "livestock"],
                         "wildlife": ["wildlife"],
+                        "domestic_animal": ["domestic_animal"],
+                        "domestic": ["domestic_animal"],
+                        "livestock": ["livestock"],
                         "plant": ["plants"]
                     }
                     should_include = False
@@ -872,13 +1095,44 @@ class MCPServer:
         """Handle LLM-powered search with intelligent query understanding"""
         query = input_data.get("query", "")
         dataset = input_data.get("dataset")
-        limit = input_data.get("limit", 50)
-        offset = input_data.get("offset", 0)
+        category_from_client = input_data.get("category") or []
+        # Cap results per request so we never serve thousands of images at once (slow load). User can paginate for more.
+        MAX_RESULTS_PER_PAGE = 50
+        limit = min(int(input_data.get("limit", 50)), MAX_RESULTS_PER_PAGE)
+        offset = int(input_data.get("offset", 0))
         dataset_offset = max(0, int(input_data.get("dataset_offset", 0)))
         
-        print(f"🧠 LLM search request: query='{query}', dataset='{dataset}', dataset_offset={dataset_offset}")
+        print(f"🧠 LLM search request: query='{query}', dataset='{dataset}', category={category_from_client}, dataset_offset={dataset_offset}")
         
         try:
+            # When user selects a dataset but leaves query empty → show all images from that dataset (no LLM)
+            query_understanding = None
+            category_only = [
+                c.strip() for c in (category_from_client if isinstance(category_from_client, list) else [category_from_client])
+                if c and str(c).strip()
+            ]
+            if (not query or not query.strip()) and dataset and dataset in self.dataset_registry.datasets:
+                query_understanding = QueryUnderstanding(
+                    intent=f"all images from {dataset}",
+                    entities=[],
+                    filters={"species": [dataset]},
+                    confidence=1.0,
+                    reasoning="Dataset-only search: show all images from the selected dataset.",
+                    description_query=None,
+                )
+                print(f"🧠 Dataset-only search: returning all images from '{dataset}' (no query)")
+            elif (not query or not query.strip()) and category_only:
+                # Empty query + category selected → browse all datasets in that category (no LLM, no species)
+                query_understanding = QueryUnderstanding(
+                    intent=f"all images in category {category_only}",
+                    entities=[],
+                    filters={"category": category_only},
+                    confidence=1.0,
+                    reasoning="Category-only browse: show all images from datasets in the selected category.",
+                    description_query=None,
+                )
+                print(f"🧠 Category-only browse: returning all images in category {category_only} (no query)")
+            
             # Get available filters for LLM context
             available_filters = {}
             if dataset:
@@ -923,23 +1177,24 @@ class MCPServer:
                             available_filters.setdefault("species", []).append(syn)
                     available_filters["species"] = sorted(list(set(available_filters["species"])))
             
-            # Use LLM to understand the query - require LLM, no rule-based fallback
-            if not self.llm_service or not self.llm_service.is_available():
-                return {
-                    "query": query,
-                    "error": "LLM service is not available. Please set OPENAI_API_KEY environment variable.",
-                    "results": [],
-                    "total_count": 0,
-                    "llm_understanding": None
-                }
-            
-            print(f"🧠 Understanding query with LLM...")
-            print(f"   LLM Service available: {self.llm_service.is_available() if self.llm_service else False}")
-            if self.llm_service:
-                print(f"   OpenAI available: {self.llm_service.openai_available}")
-                print(f"   Gemini available: {self.llm_service.gemini_available}")
-                print(f"   Provider: {self.llm_service.provider}")
-            query_understanding = await self.llm_service.understand_query(query, available_filters)
+            # Use LLM to understand the query when we have a query (skip LLM for dataset-only search)
+            if query_understanding is None:
+                if not self.llm_service or not self.llm_service.is_available():
+                    return {
+                        "query": query,
+                        "error": "LLM service is not available. Please set OPENAI_API_KEY environment variable.",
+                        "results": [],
+                        "total_count": 0,
+                        "llm_understanding": None
+                    }
+                print(f"🧠 Understanding query with LLM...")
+                print(f"   LLM Service available: {self.llm_service.is_available() if self.llm_service else False}")
+                if self.llm_service:
+                    print(f"   OpenAI available: {self.llm_service.openai_available}")
+                    print(f"   Gemini available: {self.llm_service.gemini_available}")
+                    print(f"   Provider: {self.llm_service.provider}")
+                llm_filters = self._compact_filters_for_llm(available_filters, query, dataset)
+                query_understanding = await self.llm_service.understand_query(query, llm_filters)
             
             # Normalize filters so every value is a list of strings (LLM sometimes returns nested lists or non-strings)
             def _flatten_filter_val(v):
@@ -970,6 +1225,93 @@ class MCPServer:
                             normalized.append(t)
                     if normalized:
                         query_understanding.filters["species"] = normalized
+                # Split comma-separated action values so "foraging, eating" -> ["foraging", "eating"]
+                if query_understanding.filters.get("action"):
+                    action_vals = query_understanding.filters["action"]
+                    split_actions = []
+                    for a in action_vals:
+                        for part in str(a).split(","):
+                            p = part.strip()
+                            if p:
+                                split_actions.append(p)
+                    if split_actions:
+                        query_understanding.filters["action"] = split_actions
+                # Correct LLM misparse: "cat sleeping" / "dog sleeping" sometimes returned as species "cat, pin" or "dog, pin" (sleeping heard as pin)
+                query_lower_pre = query.lower()
+                if query_understanding.filters.get("species") and "sleeping" in query_lower_pre:
+                    species_list = query_understanding.filters["species"]
+                    if len(species_list) == 1:
+                        one = species_list[0].lower().strip()
+                        if "pin" in one and not query_understanding.filters.get("action"):
+                            if "cat" in one:
+                                query_understanding.filters["species"] = ["cat"]
+                                query_understanding.filters["action"] = ["sleeping"]
+                                print(f"   ✅ Corrected LLM misparse: species 'cat, pin' → species ['cat'], action ['sleeping'] (query was 'cat sleeping')")
+                            elif "dog" in one:
+                                query_understanding.filters["species"] = ["dog"]
+                                query_understanding.filters["action"] = ["sleeping"]
+                                print(f"   ✅ Corrected LLM misparse: species 'dog, pin' → species ['dog'], action ['sleeping'] (query was 'dog sleeping')")
+                # Correct LLM misparse: "dog eating" / "cat feeding" etc. sometimes returned as species "eating" or "feeding" (action word in species)
+                action_only_words = {"eating", "feeding", "foraging"}
+                if query_understanding.filters.get("species") and (action_only_words & set(query_lower_pre.split())):
+                    species_list = list(query_understanding.filters["species"])
+                    if len(species_list) == 1:
+                        one = species_list[0].lower().strip().replace(" ", "_")
+                        if one in action_only_words:
+                            # Query has form "X eating" or "X feeding" etc.; use X as species, one as action (fix even if action already set)
+                            if "dog" in query_lower_pre:
+                                query_understanding.filters["species"] = ["dog"]
+                                query_understanding.filters["action"] = [one]
+                                print(f"   ✅ Corrected LLM misparse: species [{one!r}] → species ['dog'], action [{one!r}] (query was '{query}')")
+                            elif "cat" in query_lower_pre:
+                                query_understanding.filters["species"] = ["cat"]
+                                query_understanding.filters["action"] = [one]
+                                print(f"   ✅ Corrected LLM misparse: species [{one!r}] → species ['cat'], action [{one!r}] (query was '{query}')")
+                # Correct metadata misparse: "cat walking" / "dog walking" sometimes returned as species ["and", "king", "pea", "the", "thin", "walking"] (words from action descriptions in filters)
+                _nonsense_species = {"and", "king", "pea", "tan", "the", "thin", "walking", "or", "at", "in", "on", "for", "of", "with", "within", "from", "an", "a"}
+                if query_understanding.filters.get("species"):
+                    species_set = {s.lower().strip() for s in query_understanding.filters["species"]}
+                    if species_set and species_set <= _nonsense_species:
+                        if re.search(r"\bcat\b", query_lower_pre):
+                            query_understanding.filters["species"] = ["cat"]
+                            print(f"   ✅ Corrected metadata misparse: species {list(species_set)} → ['cat'] (query was '{query}')")
+                        elif re.search(r"\bdog\b", query_lower_pre):
+                            query_understanding.filters["species"] = ["dog"]
+                            print(f"   ✅ Corrected metadata misparse: species {list(species_set)} → ['dog'] (query was '{query}')")
+                # Split species values that contain commas (e.g. "bobcat, dog" → ["bobcat", "dog"]) so we don't look for literal "cat, pin"
+                if query_understanding.filters.get("species"):
+                    expanded = []
+                    for s in query_understanding.filters["species"]:
+                        if "," in str(s):
+                            expanded.extend(x.strip() for x in str(s).split(",") if x.strip())
+                        elif str(s).strip():
+                            expanded.append(str(s).strip())
+                    if expanded:
+                        query_understanding.filters["species"] = expanded
+                # Remove time words from species when they belong in time filter (e.g. LLM put "day" in species for "cat at daytime")
+                # Otherwise "day" matches pest datasets like "Dog-Day Cicada" and we get cicada images in cat search.
+                if query_understanding.filters.get("species") and query_understanding.filters.get("time"):
+                    time_vals = {str(t).lower().strip() for t in query_understanding.filters["time"]}
+                    time_words_in_species = {"day", "night", "dawn", "dusk", "morning", "afternoon", "evening", "daytime", "nighttime"}
+                    if time_vals & time_words_in_species:
+                        species_cleaned = [
+                            s for s in query_understanding.filters["species"]
+                            if str(s).lower().strip() not in time_words_in_species
+                        ]
+                        if species_cleaned != query_understanding.filters["species"]:
+                            query_understanding.filters["species"] = species_cleaned
+                            print(f"   ✅ Removed time words from species (kept time in time filter): {species_cleaned}")
+                # When user asked for mouse (rodent) but LLM returned a pest like "mouse moth", treat as rodent search
+                if query and re.search(r"\bmouse\b|\bmice\b", (query or "").lower()) and query_understanding.filters.get("species"):
+                    species_list = query_understanding.filters["species"]
+                    # If every species value looks like the insect (e.g. "mouse moth") not the rodent, override to "mouse"
+                    all_mouse_moth_like = all(
+                        "moth" in str(s).lower() and "mouse" in str(s).lower()
+                        for s in species_list if s
+                    ) and len(species_list) >= 1
+                    if all_mouse_moth_like:
+                        query_understanding.filters["species"] = ["mouse"]
+                        print(f"   ✅ Query is mouse/mice (rodent) but species was pest (e.g. mouse moth) → species ['mouse']")
                 # Map opossum/oppossum to canonical dataset name (e.g. virginia_opossum) so pre-filtering finds the dataset
                 if query_understanding.filters.get("species") and self.dataset_registry.datasets:
                     species_list = query_understanding.filters["species"]
@@ -979,6 +1321,23 @@ class MCPServer:
                         if canonical:
                             rest = [s for s in species_list if str(s).lower() not in opossum_vals]
                             query_understanding.filters["species"] = sorted(list(set(rest + canonical)))
+                # When user asked for a generic term (e.g. "bumble bee") but LLM returned one specific species (e.g. "black and gold bumble bee"),
+                # expand to all species/datasets containing the query so page 2 and "load more" return results instead of "no images found".
+                if query and available_filters and query_understanding.filters.get("species"):
+                    species_list = query_understanding.filters["species"]
+                    query_lower = query.lower().strip()
+                    if len(species_list) == 1 and (" " in query_lower or len(query_lower) >= 8):
+                        one = str(species_list[0]).lower().strip()
+                        if query_lower in one and len(one) > len(query_lower):
+                            # Query is substring of species (e.g. "bumble bee" in "black and gold bumble bee") — expand to all matching
+                            from_available = [
+                                s for s in (available_filters.get("species") or [])
+                                if s and query_lower in str(s).lower()
+                            ]
+                            if from_available:
+                                expanded = sorted(list(set(species_list + from_available)))
+                                query_understanding.filters["species"] = expanded
+                                print(f"   ✅ Expanded species to all matching query '{query_lower}': {len(expanded)} species (was 1)")
             
             # Reject rule-based fallback results - require real LLM understanding
             if query_understanding.confidence < 0.7:
@@ -995,6 +1354,29 @@ class MCPServer:
             # Ensure plant_state is set when query clearly asks for ripeness (e.g. "raspberry ripe")
             # LLM sometimes omits it; without it we return all images and strict filter never runs
             query_lower = query.lower()
+
+            # Collapse an over-expanded species filter. The rule-based matcher can expand a bare group word
+            # like "grasshopper" into every matching common name (e.g. 60 "* grasshopper" species). Their
+            # shared descriptor segments ("eastern", "bird") then wrongly match wildlife datasets (skunk,
+            # squirrel, bird). If the query is essentially just ONE generic insect group word, keep only that
+            # word so we cleanly match the group and the UI shows a single, sensible filter.
+            _expanded_species = query_understanding.filters.get("species") or []
+            if len(_expanded_species) >= 3:
+                def _sing_tok(t: str) -> str:
+                    return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
+                _q_terms = {_sing_tok(t) for t in re.findall(r"[a-z]+", query_lower)}
+                _q_pest = {t for t in _q_terms if t in _PEST_TYPE_WORDS_SET}
+                _q_specific = {
+                    t for t in _q_terms
+                    if len(t) >= 3 and t not in _PEST_TYPE_WORDS_SET and t not in _NON_SUBJECT_WORDS
+                }
+                if len(_q_pest) == 1 and not _q_specific:
+                    _group = next(iter(_q_pest))
+                    if all(re.search(rf"\b{re.escape(_group)}s?\b", str(s).lower()) for s in _expanded_species):
+                        query_understanding.filters["species"] = [_group]
+                        if query_understanding.confidence < 0.9:
+                            query_understanding.confidence = 0.9
+                        print(f"🧠 Collapsed {len(_expanded_species)} expanded species sharing '{_group}' → ['{_group}'] (query is the group word)")
             plant_fruit_species = {"raspberry", "raspberries", "strawberry", "strawberries", "blueberry", "blueberries", "blackberry", "blackberries"}
             species_in_query = [s for s in (query_understanding.filters.get("species") or []) if s]
             species_lower = {s.lower().strip().replace("_", "") for s in species_in_query}
@@ -1006,8 +1388,26 @@ class MCPServer:
                 query_understanding.filters["plant_state"] = ["unripe"]
                 print(f"   ✅ Injected plant_state: ['unripe'] from query")
             
+            # Goat tail position: "tail up" / "tail down" → tail_positions (used by goat_2)
+            species_for_tail = {s.lower().strip().replace(" ", "_") for s in (query_understanding.filters.get("species") or [])}
+            if species_for_tail & {"goat", "goat_2"} and "tail" in query_lower and not query_understanding.filters.get("tail_positions"):
+                if "tail up" in query_lower or "tail  up" in query_lower or ("tail" in query_lower and " up" in query_lower):
+                    query_understanding.filters["tail_positions"] = ["up"]
+                    print(f"   ✅ Injected tail_positions: ['up'] from query")
+                elif "tail down" in query_lower or "tail  down" in query_lower or ("tail" in query_lower and " down" in query_lower):
+                    query_understanding.filters["tail_positions"] = ["down"]
+                    print(f"   ✅ Injected tail_positions: ['down'] from query")
+            
             # If query clearly mentions a fruit/species but LLM left species empty, inject so we only search that dataset.
             query_species = query_understanding.filters.get("species") or []
+            # Track whether the LLM itself supplied the species. If it didn't but we resolve it
+            # server-side below, the query WAS understood (and matches the catalog exactly), so we
+            # later raise the AI-confidence score to reflect that instead of the LLM's low fallback.
+            llm_provided_species = bool(query_species)
+            # True once we resolve a SPECIFIC dataset from a common name (e.g. "golden beetle" →
+            # golden tortoise beetle). When set, we skip the generic pest-type-word injection so we
+            # don't broaden the search back out to every beetle/bug dataset.
+            cn_injected = False
             dataset_names_lower = {dn.lower(): dn for dn in self.dataset_registry.datasets}
             # Opossum / oppossum (common misspelling): inject first so we never search all datasets
             if not query_species and self.dataset_registry.datasets:
@@ -1082,6 +1482,41 @@ class MCPServer:
                             query_understanding.filters["species"] = [dataset_names_lower[word_singular]]
                             print(f"   ✅ Injected species: ['{dataset_names_lower[word_singular]}'] from query word '{word}'")
                             break
+                # Generic subject-word → dataset match: e.g. "squirrel" → eastern_fox_squirrel, eaestern_gray_squirrel;
+                # "fox" → red_fox, grey_fox. Match query words as whole segments of dataset names (split on _ or -),
+                # preferring non-pest datasets so we don't pull in thousands of pests for a common animal word.
+                if not query_understanding.filters.get("species"):
+                    subject_words = [
+                        w for w in re.findall(r"[a-z]+", query_lower)
+                        if len(w) >= 3 and w not in _NON_SUBJECT_WORDS
+                    ]
+                    non_pest_types = {"wildlife", "domestic_animal", "livestock", "plants"}
+                    seg_nonpest, seg_pest = [], []
+                    for word in subject_words:
+                        word_sing = word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
+                        # Plain words match dataset name SEGMENTS (e.g. "squirrel" → eastern_fox_squirrel).
+                        seg_terms = {word, word_sing}
+                        # Common-name synonyms (e.g. "groundhog" → "woodchuck") match as a substring so spelling
+                        # variants in dataset names still resolve.
+                        syn_terms = {_SPECIES_SYNONYMS[w] for w in (word, word_sing) if w in _SPECIES_SYNONYMS}
+                        for dn in self.dataset_registry.datasets:
+                            dn_l = dn.lower()
+                            segs = re.split(r"[_\-]", dn_l)
+                            if any(t in segs for t in seg_terms) or any(t in dn_l for t in syn_terms):
+                                dtype = self.dataset_registry.infer_type_from_name(dn)
+                                (seg_nonpest if dtype in non_pest_types else seg_pest).append(dn)
+                    chosen = sorted(set(seg_nonpest)) or sorted(set(seg_pest))
+                    if chosen:
+                        query_understanding.filters["species"] = chosen
+                        print(f"   ✅ Injected species from subject word(s) → datasets: {chosen}")
+                # Common-name phrase → scientific-name dataset (e.g. "painted lady" → Vanessa_cardui),
+                # for datasets named by scientific name where the common name lives in metadata.
+                if not query_understanding.filters.get("species"):
+                    cn_datasets = self._resolve_datasets_by_common_name(query)
+                    if cn_datasets:
+                        query_understanding.filters["species"] = sorted(cn_datasets)
+                        cn_injected = True
+                        print(f"   ✅ Injected species from common name → datasets: {sorted(cn_datasets)}")
                 # Rabbit = cottontail = white cottontail: if query mentions any and no species yet, use eastern_cottontail (not white_cottontail)
                 if not query_understanding.filters.get("species") and self.dataset_registry.datasets:
                     if "rabbit" in query_lower or "cottontail" in query_lower or "rabbits" in query_lower or "cottontails" in query_lower or "white cottontail" in query_lower or "white cottontails" in query_lower:
@@ -1109,17 +1544,75 @@ class MCPServer:
                 ]
                 query_species_list = query_understanding.filters.get("species") or []
                 species_set = {s.lower().strip() for s in query_species_list}
-                for type_word in _PEST_TYPE_WORDS:
-                    type_lower = type_word.lower()
-                    type_singular = type_lower.rstrip("s") if type_lower.endswith("s") and len(type_lower) > 1 else type_lower
-                    if type_lower in query_lower or type_singular in query_lower:
-                        if type_singular not in species_set and type_lower not in species_set:
-                            if not any(type_singular in s or type_lower in s for s in species_set):
-                                query_species_list.append(type_singular)
-                                species_set.add(type_singular)
-                                print(f"   ✅ Injected species (pest type from query): '{type_singular}'")
+                # Skip generic pest-type injection when a specific common-name dataset was already resolved
+                # (e.g. "golden beetle" → golden tortoise beetle; don't also add generic "beetle").
+                if not cn_injected:
+                    for type_word in _PEST_TYPE_WORDS:
+                        type_lower = type_word.lower()
+                        type_singular = type_lower.rstrip("s") if type_lower.endswith("s") and len(type_lower) > 1 else type_lower
+                        # Match WHOLE words/phrases only, so "bug" does not match inside "ladybug".
+                        if re.search(rf"\b{re.escape(type_lower)}\b", query_lower) or re.search(rf"\b{re.escape(type_singular)}\b", query_lower):
+                            if type_singular not in species_set and type_lower not in species_set:
+                                if not any(type_singular in s or type_lower in s for s in species_set):
+                                    query_species_list.append(type_singular)
+                                    species_set.add(type_singular)
+                                    print(f"   ✅ Injected species (pest type from query): '{type_singular}'")
                 if query_species_list != (query_understanding.filters.get("species") or []):
                     query_understanding.filters["species"] = sorted(list(set(query_species_list)))
+
+            # Time: inject canonical buckets when the query mentions time but the LLM omitted it
+            if query and not query_understanding.filters.get("time"):
+                ql = query.lower()
+                injected_times = []
+                for bucket, phrases in _TIME_QUERY_PHRASES.items():
+                    if re.search(rf"\b{re.escape(bucket)}\b", ql) or any(p in ql for p in phrases):
+                        injected_times.append(bucket)
+                if injected_times:
+                    query_understanding.filters["time"] = sorted(set(injected_times))
+                    print(f"   ✅ Injected time: {query_understanding.filters['time']} from query")
+
+            # Action: inject a canonical action when the query names a behavior but the LLM omitted it.
+            # Without this, a leftover behavior word (e.g. "eating") would be treated as a required literal
+            # description phrase and wrongly exclude images described as "foraging"/"feeding".
+            if query and not query_understanding.filters.get("action"):
+                qwords = set(re.findall(r"[a-z]+", query.lower()))
+                injected_actions = [
+                    canonical for canonical, variations in _ACTION_QUERY_MAP.items()
+                    if qwords & set(variations)
+                ]
+                if injected_actions:
+                    query_understanding.filters["action"] = sorted(set(injected_actions))
+                    print(f"   ✅ Injected action: {query_understanding.filters['action']} from query")
+
+            # Category from the UI dropdown is a HARD restriction: only datasets of that data type are searched.
+            ui_categories = [
+                c.strip() for c in (category_from_client if isinstance(category_from_client, list) else [category_from_client])
+                if c and str(c).strip()
+            ]
+            if ui_categories:
+                query_understanding.filters["category"] = ui_categories
+                print(f"   ✅ Category filter from UI (hard restriction): {ui_categories}")
+                # If the detected species clearly belongs to a different category, explain instead of returning nonsense.
+                detected_species = query_understanding.filters.get("species") or []
+                inferred_categories = self._species_implied_categories(detected_species) if detected_species else set()
+                if inferred_categories and not self._category_compatible(ui_categories, inferred_categories):
+                    species_str = ", ".join(str(s) for s in detected_species)
+                    ui_str = ", ".join(ui_categories)
+                    inferred_str = ", ".join(sorted(inferred_categories))
+                    print(f"   ⚠️  UI category {ui_categories} conflicts with species {detected_species} ({inferred_str})")
+                    return {
+                        "query": query,
+                        "llm_understanding": query_understanding,
+                        "results": [],
+                        "total_count": 0,
+                        "error": (
+                            f"'{species_str}' is in the {inferred_str} category, not {ui_str}. "
+                            f"Set Category to 'All categories'"
+                            + (f" or '{inferred_str}'" if inferred_str else "")
+                            + " to see these results."
+                        ),
+                        "searched_datasets": [],
+                    }
 
             # Validate filters were extracted correctly
             # Also check if query contains species words that aren't in available filters
@@ -1157,6 +1650,62 @@ class MCPServer:
                     "llm_understanding": query_understanding,
                 }
             
+            # If LLM found entities (e.g. "celery") but set species filter empty (no direct match), either
+            # inject matching species (e.g. "celery" -> celery dataset, or celery leaftier/looper if no celery dataset) or return "not found".
+            # Prefer exact dataset match when present so "celery" returns the celery (plant) dataset, not only pests.
+            if not query_understanding.filters.get("species") and getattr(query_understanding, "entities", None):
+                entities = [e.strip() for e in query_understanding.entities if e and str(e).strip()]
+                if entities:
+                    dataset_names_norm = {name.lower().strip().replace("_", "").replace("-", "").replace(" ", ""): name for name in self.dataset_registry.datasets}
+                    available_species_norm = {s.lower().strip().replace("_", "").replace("-", "").replace(" ", ""): s for s in available_species}
+                    injected = []
+                    for ent in entities:
+                        ent_lower = ent.lower().strip()
+                        ent_norm = ent_lower.replace("_", "").replace("-", "").replace(" ", "")
+                        exact_matches = []
+                        partial_matches = []
+                        for norm, orig in list(dataset_names_norm.items()) + list(available_species_norm.items()):
+                            if ent_norm == norm:
+                                exact_matches.append(orig)
+                            elif (len(ent_norm) >= 3 and ent_norm in norm) or (len(norm) >= 3 and norm in ent_norm):
+                                partial_matches.append(orig)
+                        if exact_matches:
+                            for o in exact_matches:
+                                if o not in injected:
+                                    injected.append(o)
+                        else:
+                            for o in partial_matches:
+                                if o not in injected:
+                                    injected.append(o)
+                    if injected:
+                        query_understanding.filters["species"] = sorted(list(set(injected)))
+                        print(f"   ✅ Injected species from entities (no direct match): {query_understanding.filters['species']}")
+                    else:
+                        # Entity has no match in catalog — return clear error instead of wrong images
+                        return {
+                            "query": query,
+                            "error": f"Species '{entities[0]}' not found in our catalog. Try a different species or check the spelling.",
+                            "results": [],
+                            "total_count": 0,
+                            "llm_understanding": query_understanding,
+                        }
+            
+            # If the LLM pinned the species only to a GENERIC pest-type word (e.g. "beetles" for
+            # "golden beetles"), the earlier common-name resolver was skipped because a species was
+            # already set. Try to refine it to the specific dataset via the common-name index so the
+            # search isn't left with an unmatched generic word.
+            current_species = query_understanding.filters.get("species") or []
+            if current_species and not cn_injected and self.dataset_registry.datasets:
+                def _is_generic_pest_word(s: str) -> bool:
+                    s2 = s.lower().strip().replace("_", " ").replace("-", " ")
+                    return s2 in _PEST_TYPE_WORDS_SET or s2.rstrip("s") in _PEST_TYPE_WORDS_SET
+                if all(_is_generic_pest_word(s) for s in current_species):
+                    specific_datasets = self._resolve_datasets_by_common_name(query)
+                    if specific_datasets:
+                        query_understanding.filters["species"] = sorted(specific_datasets)
+                        cn_injected = True
+                        print(f"   ✅ Refined generic pest type {current_species} → specific datasets: {sorted(specific_datasets)}")
+            
             if query_understanding.filters.get("species"):
                 print(f"   ✅ Species filter: {query_understanding.filters['species']}")
                 # Check if species filter matches available species
@@ -1186,6 +1735,16 @@ class MCPServer:
                     s for s in unmatched_species
                     if (s.lower().strip().replace("_", "").replace("-", "")) not in dataset_names_norm
                 ]
+                # Also treat as matched if species exactly equals a dataset name or is prefix (e.g. "goat" matches "goat", "goat_2")
+                if self.dataset_registry.datasets:
+                    def _species_matches_any_dataset(sp: str) -> bool:
+                        sp_lo = sp.lower().strip()
+                        for dn in self.dataset_registry.datasets:
+                            dn_lo = dn.lower()
+                            if dn_lo == sp_lo or dn_lo.startswith(sp_lo + "_") or dn_lo.startswith(sp_lo + "-"):
+                                return True
+                        return False
+                    unmatched_species = [s for s in unmatched_species if not _species_matches_any_dataset(s)]
                 
                 # If species filter doesn't match any available species, return error (no long species list)
                 if unmatched_species and len(unmatched_species) == len(species_filter):
@@ -1196,6 +1755,17 @@ class MCPServer:
                         "total_count": 0,
                         "llm_understanding": query_understanding,
                     }
+                # The species was resolved server-side (the LLM didn't supply it) and maps to a real
+                # catalog dataset, so the query WAS understood. Raise the AI-confidence score from the
+                # LLM's low fallback (e.g. 0.5) so it doesn't look uncertain next to a 100% filter match.
+                if not llm_provided_species and query_understanding.confidence < 0.9:
+                    query_understanding.confidence = 0.9
+                    note = "Confidence raised: query resolved to a catalog dataset server-side."
+                    query_understanding.reasoning = (
+                        f"{query_understanding.reasoning} {note}".strip()
+                        if query_understanding.reasoning else note
+                    )
+                    print("   ✅ AI confidence raised to 0.90 (species resolved server-side)")
             
             if query_understanding.filters.get("time"):
                 print(f"   ✅ Time filter: {query_understanding.filters['time']}")
@@ -1242,7 +1812,18 @@ class MCPServer:
                     if r == name_normalized or name_normalized.startswith(r + "_") or name_normalized.startswith(r + "-"):
                         return True
                     r_singular = _normalize_plural(r)
+                    r_is_generic_pest = r in _PEST_TYPE_WORDS_SET or r_singular in _PEST_TYPE_WORDS_SET
                     if r_singular == name_normalized or name_normalized.startswith(r_singular + "_") or name_normalized.startswith(r_singular + "-"):
+                        return True
+                    # Species as segment or suffix: "cat" matches "domestic_cat" or "bobcat"
+                    segments = name_normalized.replace("-", "_").split("_")
+                    if r in segments or r_singular in segments:
+                        return True
+                    if name_normalized.endswith("_" + r) or name_normalized.endswith("_" + r_singular):
+                        return True
+                    # Do not let short generic pest words match inside unrelated names:
+                    # "ant"/"ants" must not match "plant"/"plants".
+                    if not r_is_generic_pest and (name_normalized.endswith(r) or name_normalized.endswith(r_singular)):
                         return True
                 # Species/collections from this dataset
                 opts = dataset_obj.available_filters
@@ -1255,26 +1836,58 @@ class MCPServer:
                                 return True
                             if v_singular in requested or v_singular in requested_singular:
                                 return True
-                            if any(r in v or v in r or _normalize_plural(r) in v or v_singular in r for r in requested):
-                                return True
+                            # Match on whole _-delimited segment sequences only, NOT arbitrary substrings, so
+                            # e.g. "striped" (from "striped skunk") does not match inside "greenstriped grasshopper"
+                            # and "ant" does not match inside "plant".
+                            def _seg_contains(haystack: str, needle: str) -> bool:
+                                if not needle:
+                                    return False
+                                return bool(re.search(rf"(^|_){re.escape(needle)}(_|$)", haystack))
+                            for r in requested:
+                                r_norm = _normalize_plural(r)
+                                r_is_generic_pest = r in _PEST_TYPE_WORDS_SET or r_norm in _PEST_TYPE_WORDS_SET
+                                # requested species appears as full segment(s) of the dataset value
+                                if _seg_contains(v, r) or _seg_contains(v, r_norm):
+                                    return True
+                                if r_is_generic_pest:
+                                    continue
+                                # dataset value appears as full segment(s) of the requested species
+                                # (e.g. v="bumble_bee" within r="american_bumble_bee"); require length > 3 to
+                                # avoid matching tiny tokens.
+                                if (len(v) > 3 and _seg_contains(r, v)) or (len(v_singular) > 3 and _seg_contains(r, v_singular)):
+                                    return True
+                                if v_singular in r and len(v_singular) > 6:
+                                    return True
                 return False
 
             candidate_datasets = list(self.dataset_registry.datasets.items())
             dataset_names_set = set(self.dataset_registry.datasets.keys())
 
             if species_filter:
-                # If exactly one species and it equals a dataset name (e.g. "carrot", "raspberry"), search only that dataset.
+                # If exactly one species and it equals a dataset name (e.g. "carrot", "raspberry"), search that dataset.
+                # For "goat", search both "goat" and "goat_2" (goat_2 has tail_positions for "goat with tail up").
                 dataset_names_lower = {name.lower(): name for name in dataset_names_set}
                 if len(species_filter) == 1:
                     s = species_filter[0].lower().strip().replace(" ", "_")
                     if s in dataset_names_lower:
-                        datasets_to_search = [dataset_names_lower[s]]
-                        print(f"🧠 Species '{s}' matches dataset name → searching only dataset: {datasets_to_search[0]}")
+                        # Include all datasets that match this species name (e.g. goat + goat_2)
+                        datasets_to_search = [name for name in dataset_names_set if name.lower() == s or name.lower().startswith(s + "_")]
+                        datasets_to_search.sort(key=lambda x: (0 if x.lower() == s else 1, x.lower()))
+                        print(f"🧠 Species '{s}' matches dataset name(s) → searching: {datasets_to_search}")
                     else:
                         s_singular = s[:-1] if len(s) > 1 and s.endswith("s") and not s.endswith("ss") else s
                         if s_singular in dataset_names_lower:
-                            datasets_to_search = [dataset_names_lower[s_singular]]
-                            print(f"🧠 Species '{s}' (singular '{s_singular}') matches dataset name → searching only dataset: {datasets_to_search[0]}")
+                            datasets_to_search = [name for name in dataset_names_set if name.lower() == s_singular or name.lower().startswith(s_singular + "_")]
+                            datasets_to_search.sort(key=lambda x: (0 if x.lower() == s_singular else 1, x.lower()))
+                            print(f"🧠 Species '{s}' (singular '{s_singular}') matches dataset name(s) → searching: {datasets_to_search}")
+                # Even in the dataset-name shortcut, honor a UI category restriction (drop datasets of the wrong type).
+                if datasets_to_search and category_filter:
+                    before = len(datasets_to_search)
+                    datasets_to_search = [
+                        d for d in datasets_to_search if self._dataset_matches_category(d, category_filter)
+                    ]
+                    if len(datasets_to_search) != before:
+                        print(f"🧠 Category filter {category_filter} restricted dataset-name match: {before} → {len(datasets_to_search)} datasets")
                 if not datasets_to_search:
                     # Only datasets that have this species (or name match)
                     for dataset_name, dataset_obj in candidate_datasets:
@@ -1283,7 +1896,13 @@ class MCPServer:
                         if category_filter:
                             dataset_category = dataset_obj.type.value.lower()
                             category_mapping = {
-                                "pest": ["pests"], "animal": ["wildlife"], "wildlife": ["wildlife"], "plant": ["plants"]
+                                "pest": ["pests"],
+                                "animal": ["wildlife", "domestic_animal", "livestock"],
+                                "wildlife": ["wildlife"],
+                                "domestic_animal": ["domestic_animal"],
+                                "domestic": ["domestic_animal"],
+                                "livestock": ["livestock"],
+                                "plant": ["plants"]
                             }
                             if not any(
                                 dataset_category in category_mapping.get(c.lower(), [c.lower()]) or c.lower() == dataset_category
@@ -1291,22 +1910,89 @@ class MCPServer:
                             ):
                                 continue
                         datasets_to_search.append(dataset_name)
+                # When we expanded to many species (e.g. "bumble bee" → 36 species) but _species_match missed pest datasets
+                # (their filter may use scientific names), include datasets whose name contains the scientific/genus (e.g. Bombus).
+                if query and len(species_filter) > 5:
+                    q = query.lower().strip()
+                    if "bumble" in q and "bee" in q:
+                        bombus_datasets = [d for d in dataset_names_set if d and "bombus" in d.lower()]
+                        for d in bombus_datasets:
+                            if d not in datasets_to_search:
+                                datasets_to_search.append(d)
+                        if bombus_datasets:
+                            print(f"🧠 Added {len(bombus_datasets)} Bombus datasets by query phrase 'bumble bee'")
+                # When user asked for cat or dog, search only DOMESTIC_ANIMAL datasets (exclude pests like "Catocala", "Dog-Day Cicada")
+                species_lower = {s.lower().strip().replace(" ", "_") for s in species_filter if s}
+                if species_lower & {"cat", "dog"}:
+                    before = len(datasets_to_search)
+                    datasets_to_search = [
+                        d for d in datasets_to_search
+                        if self.dataset_registry.datasets.get(d) and self.dataset_registry.datasets[d].type == DatasetType.DOMESTIC_ANIMAL
+                    ]
+                    if before != len(datasets_to_search):
+                        print(f"🧠 Species includes cat/dog → restricting to DOMESTIC_ANIMAL only ({len(datasets_to_search)} datasets, excluded {before - len(datasets_to_search)} pest/other)")
+                # When user asked for mouse (rodent), exclude PEST datasets so we don't return "mouse moth" etc.
+                query_lower = (query or "").lower()
+                if not (species_lower & {"cat", "dog"}) and (
+                    (species_lower & {"mouse", "mice"}) or re.search(r"\bmouse\b|\bmice\b", query_lower)
+                ):
+                    before = len(datasets_to_search)
+                    datasets_to_search = [
+                        d for d in datasets_to_search
+                        if self.dataset_registry.datasets.get(d) and self.dataset_registry.datasets[d].type != DatasetType.PESTS
+                    ]
+                    if before != len(datasets_to_search):
+                        print(f"🧠 Query/species mentions mouse/mice (rodent) → excluding PEST datasets ({len(datasets_to_search)} datasets, excluded {before - len(datasets_to_search)} pest e.g. mouse moth)")
                 # Species was requested but no dataset matches — return immediately instead of searching all
                 if species_filter and not datasets_to_search:
-                    available_list = sorted(list(dataset_names_set))[:15]
+                    # Suggest datasets whose name contains the species term; for "cat"/"dog" prefer domestic_cat/dog
+                    term = species_filter[0].lower().strip()
+                    related = [name for name in dataset_names_set if term in name.lower()]
+                    if related:
+                        if term == "cat":
+                            related = sorted(related, key=lambda x: (
+                                0 if x == "domestic_cat" else 1,
+                                0 if (x.endswith("_cat") or x == "bobcat") else 1,
+                                len(x),
+                                x
+                            ))
+                        elif term == "dog":
+                            related = sorted(related, key=lambda x: (0 if x == "dog" else 1, len(x), x))
+                        else:
+                            related = sorted(related)
+                        related = related[:5]
+                        suggestion = f" Did you mean: {', '.join(related)}?"
+                    else:
+                        suggestion = ""
+                    # For "cat"/"dog" with no match, explicitly suggest adding domestic_cat / dog dataset
+                    if not related and term in ("cat", "dog"):
+                        suggestion = f" Add the {'domestic_cat' if term == 'cat' else 'dog'} dataset to search {'cat' if term == 'cat' else 'dog'} images."
+                    # Keep message short: avoid listing many scientific names; suggest browsing or related term
+                    available_list = sorted(list(dataset_names_set))
+                    # Prefer single-word (common-name) dataset names for the hint
+                    single_word = [n for n in available_list if " " not in n and len(n) <= 30][:5]
+                    friendly = single_word if single_word else [n for n in available_list if len(n) <= 25][:5]
+                    list_part = f" Examples: {', '.join(friendly)}{'...' if len(available_list) > len(friendly) else ''}." if friendly else ""
+                    error_msg = f"No dataset found for species '{', '.join(species_filter)}'.{suggestion}{list_part}"
                     return {
                         "query": query,
                         "llm_understanding": query_understanding,
                         "results": [],
                         "total_count": 0,
-                        "error": f"No dataset found for species '{', '.join(species_filter)}'. Available datasets include: {', '.join(available_list)}{'...' if len(self.dataset_registry.datasets) > 15 else ''}",
+                        "error": error_msg,
                         "searched_datasets": []
                     }
             elif category_filter:
                 for dataset_name, dataset_obj in candidate_datasets:
                     dataset_category = dataset_obj.type.value.lower()
                     category_mapping = {
-                        "pest": ["pests"], "animal": ["wildlife"], "wildlife": ["wildlife"], "plant": ["plants"]
+                        "pest": ["pests"],
+                        "animal": ["wildlife", "domestic_animal", "livestock"],
+                        "wildlife": ["wildlife"],
+                        "domestic_animal": ["domestic_animal"],
+                        "domestic": ["domestic_animal"],
+                        "livestock": ["livestock"],
+                        "plant": ["plants"]
                     }
                     should_include = any(
                         dataset_category in category_mapping.get(c.lower(), [c.lower()]) or c.lower() == dataset_category
@@ -1315,6 +2001,24 @@ class MCPServer:
                     if should_include:
                         datasets_to_search.append(dataset_name)
             else:
+                # No species and no category resolved. If the query clearly names a subject (likely a species)
+                # that isn't in our catalog, say so plainly instead of searching every dataset and returning a
+                # vague "no images found" message.
+                unmatched_subjects = self._unmatched_subject_words(query)
+                if unmatched_subjects:
+                    pretty = ", ".join(sorted(set(unmatched_subjects)))
+                    print(f"🧠 Query subject(s) not in catalog: {unmatched_subjects} → returning not-available message")
+                    return {
+                        "query": query,
+                        "llm_understanding": query_understanding,
+                        "results": [],
+                        "total_count": 0,
+                        "error": (
+                            f"'{pretty}' is not in our catalog yet. "
+                            f"Try a different species, or pick a Category to browse what's available."
+                        ),
+                        "searched_datasets": [],
+                    }
                 datasets_to_search = list(self.dataset_registry.datasets.keys())
 
             # When species filter matched both wildlife and pest datasets (e.g. "fox" → red fox + pests with "fox" in name), prefer wildlife and show disambiguation message
@@ -1351,14 +2055,38 @@ class MCPServer:
             elif len(datasets_to_search) < total_datasets_matching:
                 print(f"🧠 Capped search to first {MAX_DATASETS_TO_SEARCH} datasets (of {total_datasets_matching}) for faster response")
             
+            # When only one dataset matches (e.g. "raspberries" → raspberry), use single-dataset path so we
+            # return full total_count and pagination (Next/Previous) works. Otherwise we'd use multi-dataset
+            # path with early termination and total_count would cap at one page (e.g. 50).
+            if not dataset and len(datasets_to_search) == 1:
+                dataset = datasets_to_search[0]
+                print(f"🧠 Single matching dataset → using single-dataset path for full count and pagination: {dataset}")
+            
+            # datasets_to_search has ALREADY been restricted to datasets that match the species filter
+            # (by dataset name, group word, or common name). Re-applying the species filter per image is
+            # redundant and, for the common case where a dataset is keyed by scientific name while the
+            # filter is a common/group name (e.g. "grasshopper", "ant", "painted lady"), it wrongly drops
+            # every image because metadata.species holds the scientific name. So strip species from the
+            # per-image filters here; time/action/plant_state/scene still apply.
+            if species_filter:
+                print(f"🧠 Species {species_filter} already enforced at dataset level → not re-filtering per image (keeping other filters)")
+
+            def _per_image_filters(base_filters: Dict[str, Any]) -> Dict[str, Any]:
+                if species_filter and base_filters.get("species"):
+                    return {k: v for k, v in base_filters.items() if k != "species"}
+                return base_filters
+
             # Perform search using the structured understanding and adapters
             # IMPORTANT: Only use filters, not the query string, to avoid incorrect substring matches
             if dataset:
                 if dataset in datasets_to_search and dataset in self.dataset_registry.datasets:
-                    # Use adapter-based search with ONLY filters (no query string)
+                    # Dataset-only search (empty query): pass no filters so we get all images from the dataset
+                    search_filters = {} if "Dataset-only search" in getattr(query_understanding, "reasoning", "") else _per_image_filters(query_understanding.filters)
                     filtered_results = self.dataset_registry.search_dataset(
-                        dataset, "", query_understanding.filters
+                        dataset, "", search_filters
                     )
+                    cache_size = len(self.dataset_registry.images_cache.get(dataset, []))
+                    print(f"🧠 Single-dataset search: {dataset} returned {len(filtered_results)} items (cache size: {cache_size})")
                     # Apply strict plant_state filter when user asked for specific state (e.g. ripe only)
                     plant_state_filter = query_understanding.filters.get("plant_state") or []
                     if plant_state_filter:
@@ -1366,18 +2094,105 @@ class MCPServer:
                         filtered_results = [r for r in filtered_results if self._passes_plant_state_strict(r, plant_state_filter)]
                         if before != len(filtered_results):
                             print(f"🧠 Plant-state strict filter (single dataset): kept {len(filtered_results)} of {before} results (requested: {plant_state_filter})")
+                    action_filter_list = query_understanding.filters.get("action") or []
+                    if action_filter_list:
+                        before = len(filtered_results)
+                        filtered_results = [r for r in filtered_results if self._passes_action_strict(r, action_filter_list)]
+                        if before != len(filtered_results):
+                            print(f"🧠 Action strict filter (single dataset): kept {len(filtered_results)} of {before} results (requested: {action_filter_list})")
+                    # When query specifies a cultivar/variety (e.g. "Cabernet Sauvignon grapes"), require description to contain it so we exclude other varieties (e.g. Syrah).
+                    # For broad species-only queries (e.g. "raspberries") _get_required_description_phrase returns None so we don't shrink the set.
+                    req_phrase = self._get_required_description_phrase(
+                        query,
+                        query_understanding.filters.get("species") or [],
+                        getattr(query_understanding, "description_query", None),
+                    )
+                    # When species was resolved from a common name (e.g. "golden beetle" → datasets), the query
+                    # words ARE the common name and were already used to pick datasets. Don't also require them
+                    # literally in the description (image descriptions rarely repeat the common name verbatim).
+                    if req_phrase and cn_injected:
+                        print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                        req_phrase = None
+                    # Explicit: for raspberry dataset, never require "raspberries" in description — return all images.
+                    if req_phrase and str(req_phrase).lower().strip() == "raspberries" and str(dataset).lower() == "raspberry":
+                        req_phrase = None
+                        print(f"🧠 Skipping description phrase 'raspberries' for raspberry dataset (return all images)")
+                    # When we already filtered by plant_state (e.g. unripe), don't require that phrase in description (e.g. "unripe raspberries") — descriptions say "unripe berries" etc.
+                    plant_state_filter_for_phrase = query_understanding.filters.get("plant_state") or []
+                    if req_phrase and plant_state_filter_for_phrase and dataset:
+                        pl = req_phrase.lower().strip()
+                        for ps in plant_state_filter_for_phrase:
+                            ps = (ps or "").lower().strip()
+                            if ps and (pl == ps or pl.startswith(ps + " ") or ps in pl.split()):
+                                print(f"🧠 Skipping description phrase '{req_phrase}' (already filtered by plant_state '{ps}')")
+                                req_phrase = None
+                                break
+                    # Unconditionally skip description filter when phrase is just this dataset's name (or plural) — we're already on that dataset.
+                    if req_phrase and dataset:
+                        d = str(dataset).lower().strip().replace("_", " ")
+                        phrase_lower = req_phrase.lower().strip()
+                        if phrase_lower == d or phrase_lower == d + "s" or (len(d) > 1 and d.endswith("s") and phrase_lower == d[:-1]):
+                            req_phrase = None
+                            print(f"🧠 Skipping description phrase '{phrase_lower}' (same as dataset '{dataset}' / plural)")
+                    if req_phrase:
+                        before = len(filtered_results)
+                        filtered_results = [r for r in filtered_results if self._passes_description_required(r, req_phrase)]
+                        if before != len(filtered_results):
+                            print(f"🧠 Description required phrase '{req_phrase}': kept {len(filtered_results)} of {before} results (excluded items without that in description)")
                     
                     if not filtered_results:
                         # No results — return a clear, user-friendly message (do not list all species/catalogs)
                         species_filter = query_understanding.filters.get("species", [])
                         action_filter = query_understanding.filters.get("action", [])
-                        if species_filter or action_filter:
+                        plant_state_filter = query_understanding.filters.get("plant_state", [])
+
+                        # If plant_state filter eliminated all results but other plant_states exist, surface them
+                        alt_plant_states = set()
+                        if plant_state_filter and species_filter:
+                            try:
+                                alt_filters = dict(query_understanding.filters)
+                                alt_filters.pop("plant_state", None)
+                                alt_items = self.dataset_registry.search_dataset(dataset, "", alt_filters)
+                                for it in alt_items:
+                                    meta = it.get("metadata") or {}
+                                    raw = meta.get("plant_state") or meta.get("plant_states")
+                                    if isinstance(raw, list):
+                                        for p in raw:
+                                            if str(p).strip():
+                                                alt_plant_states.add(str(p).strip())
+                                    elif raw and str(raw).strip():
+                                        alt_plant_states.add(str(raw).strip())
+                            except Exception:
+                                alt_plant_states = set()
+                        # Normalize action for display: split comma-separated so "foraging, eating" -> ["foraging", "eating"]
+                        if action_filter:
+                            _split = []
+                            for a in (action_filter if isinstance(action_filter, list) else [action_filter]):
+                                for part in str(a).split(","):
+                                    p = part.strip()
+                                    if p:
+                                        _split.append(p)
+                            if _split:
+                                action_filter = _split
+                        if species_filter or action_filter or plant_state_filter:
                             parts = []
                             if species_filter:
                                 parts.append(f"species '{', '.join(species_filter)}'")
                             if action_filter:
                                 parts.append(f"action '{', '.join(action_filter)}'")
-                            err = f"No images found matching {', '.join(parts)} in our catalog. Try a different species or action."
+                            if plant_state_filter:
+                                parts.append(f"plant_state '{', '.join(plant_state_filter)}'")
+                            err = f"No images found matching {', '.join(parts)} in our catalog."
+                            if plant_state_filter and alt_plant_states:
+                                alt_list = ", ".join(sorted(alt_plant_states))
+                                err += f" This dataset does have images with other ripeness states (e.g. {alt_list}). Try searching without a ripeness filter, or using one of those states."
+                                err += " If you just deployed code changes, restart the server (or call POST /api/reload-datasets to reload data from disk)."
+                            elif plant_state_filter:
+                                err += " Try searching without a ripeness filter, or use a broader term."
+                            elif action_filter:
+                                err += " This dataset may have images with other actions (e.g. walking). Try a different action or browse all images without an action filter."
+                            else:
+                                err += " Try a different species or action."
                         else:
                             err = f"Dataset '{dataset}' has no matching results for your query."
                         return {
@@ -1390,26 +2205,43 @@ class MCPServer:
                         }
                     
                     # Add confidence scores, image URLs, and top-level display fields to each result
-                    for result in filtered_results:
-                        result['llm_confidence'] = self._calculate_result_confidence(result, query_understanding, query)
-                        result['llm_reasoning'] = query_understanding.reasoning
-                        result['llm_intent'] = query_understanding.intent
-                        result['image_url'] = self._construct_image_url(result)
-                        meta = result.get('metadata') or {}
-                        result['background'] = meta.get('background') or meta.get('scene')
-                        result['scientific_name'] = meta.get('scientific_name')
-                        cn = meta.get('common_names')
-                        result['common_names'] = cn if isinstance(cn, list) else ([cn] if cn else None)
-                    
-                    # Sort by confidence (highest first) and then by relevance
-                    filtered_results.sort(key=lambda x: (x.get('llm_confidence', 0), x.get('id', '')), reverse=True)
+                    # When result set is large, only enrich the page we return to keep response fast.
+                    total_count = len(filtered_results)
+                    if total_count > 500:
+                        # Large set: sort by id for stable order, enrich only the requested page
+                        filtered_results.sort(key=lambda x: (x.get('id') or ''))
+                        page_results = filtered_results[offset:offset + limit]
+                        for result in page_results:
+                            result['llm_confidence'] = self._calculate_result_confidence(result, query_understanding, query)
+                            result['llm_reasoning'] = query_understanding.reasoning
+                            result['llm_intent'] = query_understanding.intent
+                            result['image_url'] = self._construct_image_url(result)
+                            meta = result.get('metadata') or {}
+                            result['background'] = meta.get('background') or meta.get('scene')
+                            result['scientific_name'] = meta.get('scientific_name')
+                            cn = meta.get('common_names')
+                            result['common_names'] = cn if isinstance(cn, list) else ([cn] if cn else None)
+                    else:
+                        # Smaller set: enrich all, sort by confidence, then slice
+                        for result in filtered_results:
+                            result['llm_confidence'] = self._calculate_result_confidence(result, query_understanding, query)
+                            result['llm_reasoning'] = query_understanding.reasoning
+                            result['llm_intent'] = query_understanding.intent
+                            result['image_url'] = self._construct_image_url(result)
+                            meta = result.get('metadata') or {}
+                            result['background'] = meta.get('background') or meta.get('scene')
+                            result['scientific_name'] = meta.get('scientific_name')
+                            cn = meta.get('common_names')
+                            result['common_names'] = cn if isinstance(cn, list) else ([cn] if cn else None)
+                        filtered_results.sort(key=lambda x: (x.get('llm_confidence', 0), x.get('id', '')), reverse=True)
+                        page_results = filtered_results[offset:offset + limit]
                     
                     return {
                         "dataset": dataset,
                         "query": query,
                         "llm_understanding": query_understanding,
-                        "results": filtered_results[offset:offset + limit],
-                        "total_count": len(filtered_results)
+                        "results": page_results,
+                        "total_count": total_count
                     }
                 else:
                     return {
@@ -1423,22 +2255,25 @@ class MCPServer:
             else:
                 # Search across filtered datasets using adapters (optimized with category pre-filtering)
                 all_results = []
-                # First batch (dataset_offset=0): stop as soon as we have enough for the requested page (e.g. 20) for fast first response
-                # Next batches (dataset_offset>0): collect up to 100 so "Load next 100" returns a full batch
-                MAX_TOTAL_RESULTS = 100
-                if dataset_offset == 0:
-                    enough_results = offset + limit  # e.g. 20 — return as soon as we have one page
+                # When few datasets match (e.g. "cat" → 1–2 datasets), collect ALL results so total_count and pagination are correct.
+                # When many datasets match, cap collection so first response stays fast; cap high enough for many pages.
+                MAX_TOTAL_RESULTS_CAPPED = 5000
+                few_datasets = len(datasets_to_search) <= 25
+                if few_datasets:
+                    enough_results = MAX_TOTAL_RESULTS_CAPPED + 1  # collect all from this batch (no early termination)
+                elif dataset_offset == 0:
+                    enough_results = max(offset + limit, 500)  # at least 10 pages of 50
                 else:
-                    enough_results = min(offset + limit + 80, MAX_TOTAL_RESULTS)
+                    enough_results = min(offset + limit + 500, MAX_TOTAL_RESULTS_CAPPED)
                 
                 for dataset_name in datasets_to_search:
                     if len(all_results) >= enough_results:
-                        print(f"🧠 Early termination: have {len(all_results)} results (need {offset + limit}), stopping dataset search")
+                        print(f"🧠 Early termination: have {len(all_results)} results (need up to {enough_results}), stopping dataset search")
                         break
                     print(f"🧠 Searching dataset: {dataset_name}")
                     # Use adapter-based search with ONLY filters (no query string)
                     filtered_results = self.dataset_registry.search_dataset(
-                        dataset_name, "", query_understanding.filters
+                        dataset_name, "", _per_image_filters(query_understanding.filters)
                     )
                     print(f"   Found {len(filtered_results)} matching results in {dataset_name}")
                     if filtered_results:
@@ -1471,6 +2306,31 @@ class MCPServer:
                     all_results = [r for r in all_results if self._passes_plant_state_strict(r, plant_state_filter)]
                     if before != len(all_results):
                         print(f"🧠 Plant-state strict filter: kept {len(all_results)} of {before} results (requested: {plant_state_filter})")
+                # When user asked for a specific action (e.g. sleeping), keep only items that pass strict action check (action + description)
+                action_filter_list = query_understanding.filters.get("action") or []
+                if action_filter_list:
+                    before = len(all_results)
+                    all_results = [r for r in all_results if self._passes_action_strict(r, action_filter_list)]
+                    if before != len(all_results):
+                        print(f"🧠 Action strict filter: kept {len(all_results)} of {before} results (requested: {action_filter_list})")
+                # When query specifies a cultivar/variety (e.g. "Cabernet Sauvignon grapes"), require description to contain it
+                # Skip when we already filtered by tail_positions or scene — adapter used metadata; requiring phrase would exclude valid items (e.g. "goats field" vs "goats in a field").
+                req_phrase = None
+                if not query_understanding.filters.get("tail_positions") and not query_understanding.filters.get("scene"):
+                    req_phrase = self._get_required_description_phrase(
+                        query,
+                        query_understanding.filters.get("species") or [],
+                        getattr(query_understanding, "description_query", None),
+                    )
+                # Species resolved from a common name: don't also require those words in the description.
+                if req_phrase and cn_injected:
+                    print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                    req_phrase = None
+                if req_phrase:
+                    before = len(all_results)
+                    all_results = [r for r in all_results if self._passes_description_required(r, req_phrase)]
+                    if before != len(all_results):
+                        print(f"🧠 Description required phrase '{req_phrase}': kept {len(all_results)} of {before} results (excluded items without that in description)")
                 
                 print(f"🧠 Total LLM-filtered results found: {len(all_results)}")
                 
@@ -1495,7 +2355,12 @@ class MCPServer:
                         # Short, user-friendly hint (do not list thousands of species/pest names)
                         if query_understanding.filters.get("plant_state"):
                             error_msg += " Try searching without a ripeness filter, or use a broader term."
-                        elif query_understanding.filters.get("species") or query_understanding.filters.get("action"):
+                            error_msg += " If you just deployed code changes, restart the server (or POST /api/reload-datasets to reload data)."
+                        elif query_understanding.filters.get("action"):
+                            error_msg += " This dataset may have images with other actions (e.g. walking). Try a different action or browse all images without an action filter."
+                        elif query_understanding.filters.get("scene"):
+                            error_msg += " Try a different scene (e.g. indoor) or remove the scene filter."
+                        elif query_understanding.filters.get("species"):
                             error_msg += " Try a different species or action."
                         
                         return {
@@ -1743,6 +2608,10 @@ class MCPServer:
                 return True
             elif time_filter == "dusk" and ("dusk" in time_info or "sunset" in time_info):
                 return True
+            elif time_filter == "evening" and (
+                "evening" in time_info or "twilight" in time_info or "late afternoon" in time_info
+            ):
+                return True
         
         return False
     
@@ -1758,16 +2627,40 @@ class MCPServer:
         return any(season.lower() in image_season for season in season_filters)
     
     def _construct_image_url(self, result: Dict[str, Any]) -> str:
-        """Construct image URL from result data"""
+        """Construct image URL from result data. For datasets like goat/goat_2, images on disk use prefix (goat_..., goat_2_...)."""
         try:
             metadata = result.get("metadata", {})
             result_id = result.get("id", "")
+            dataset = result.get("dataset", "")
             
             # Priority 1: Check if image_url is explicitly set
             if "image_url" in result:
                 return result["image_url"]
             
-            # Priority 2: Try id with common extensions (all images are expected under MCP names, e.g. grapes_300.jpg)
+            # Priority 2: When result has a dataset, try dataset-prefixed filename (e.g. goat_001.jpg or goat_Luzignan-....jpg)
+            if result_id and dataset:
+                from pathlib import Path
+                images_dir = Path(IMAGES_DIR)
+                if images_dir.exists():
+                    # If id already has dataset prefix (e.g. goat_001), use it as the filename stem so we request goat_001.jpg
+                    if result_id.startswith(dataset + "_"):
+                        stem = result_id
+                    else:
+                        stem = f"{dataset}_{result_id}"
+                    for ext in [".jpg", ".jpeg", ".png", ".gif", ".JPG", ".JPEG", ".PNG", ".GIF"]:
+                        potential_filename = f"{stem}{ext}"
+                        potential_path = images_dir / potential_filename
+                        if potential_path.exists() and potential_path.is_file():
+                            return f"/images/{potential_filename}"
+                    # Try in dataset subdir without prefix (e.g. goat/Luzignan-20160310_140237.jpg)
+                    subdir = images_dir / dataset
+                    if subdir.is_dir():
+                        for ext in [".jpg", ".jpeg", ".png", ".gif", ".JPG", ".JPEG", ".PNG", ".GIF"]:
+                            potential_path = subdir / f"{result_id}{ext}"
+                            if potential_path.exists() and potential_path.is_file():
+                                return f"/images/{dataset}/{result_id}{ext}"
+            
+            # Priority 3: Try id with common extensions
             if result_id:
                 from pathlib import Path
                 images_dir = Path(IMAGES_DIR)
@@ -1778,8 +2671,9 @@ class MCPServer:
                         if potential_path.exists() and potential_path.is_file():
                             return f"/images/{potential_filename}"
             
-            # Priority 3: Try original_filename from metadata (when it equals MCP name)
-            if "original_filename" in metadata:
+            # Priority 4: Try original_filename from metadata (skip when we have canonical dataset id — serve goat_001.jpg not original name)
+            has_canonical_stem = result_id and dataset and result_id.startswith(dataset + "_")
+            if not has_canonical_stem and "original_filename" in metadata:
                 original_filename = metadata["original_filename"]
                 filename = Path(original_filename).name
                 from pathlib import Path
@@ -1797,7 +2691,10 @@ class MCPServer:
                 # If not found locally, return the filename anyway (might be on server)
                 return f"/images/{filename}"
             
-            # Priority 4: Fallback to id with .jpg
+            # Priority 5: Fallback — use correct filename (id already prefixed e.g. goat_001, or dataset_id)
+            if result_id and dataset:
+                stem = result_id if result_id.startswith(dataset + "_") else f"{dataset}_{result_id}"
+                return f"/images/{stem}.jpg"
             if result_id:
                 return f"/images/{result_id}.jpg"
             
@@ -1817,6 +2714,293 @@ class MCPServer:
         s = str(value).strip()
         return [s] if s else []
 
+    def _build_common_name_index(self) -> Dict[str, List[str]]:
+        """Build (and cache) a map from common-name / scientific-name phrase → dataset name(s).
+
+        Many datasets are named by scientific name (e.g. "Vanessa_cardui") but users search by common
+        name (e.g. "painted lady"). Common names live in each item's metadata (common_name, common_names,
+        scientific_name). We index the whole phrase (not sub-words) so a multi-word common name only matches
+        when it appears in full, avoiding noise from generic words like "moth" or "white".
+        """
+        if self._common_name_index is not None:
+            return self._common_name_index
+
+        index: Dict[str, set] = {}
+
+        def _add(phrase: str, dataset_name: str):
+            norm = re.sub(r"[_\-]+", " ", str(phrase or "")).lower().strip()
+            norm = re.sub(r"\s+", " ", norm)
+            if not norm:
+                return
+            n_words = norm.split()
+            # Skip description-like text and absurdly long phrases.
+            if len(norm) > 40 or len(n_words) > 4:
+                return
+            # Skip single generic words (pest-type words, non-subject words, very short words);
+            # those are handled by the existing pest-type and available-filters paths.
+            if len(n_words) == 1:
+                w = n_words[0]
+                if len(w) < 4 or w in _NON_SUBJECT_WORDS or w in _PEST_TYPE_WORDS_SET:
+                    return
+            index.setdefault(norm, set()).add(dataset_name)
+
+        for dn, items in self.dataset_registry.images_cache.items():
+            if not items:
+                continue
+            # Identity fields are constant within a (pest) dataset, so sampling a few items is enough.
+            for item in items[:3]:
+                meta = item.get("metadata") or {}
+                for val in (meta.get("common_name"), meta.get("scientific_name")):
+                    if val:
+                        _add(val, dn)
+                cn = meta.get("common_names")
+                if isinstance(cn, list):
+                    for c in cn:
+                        _add(c, dn)
+                elif cn:
+                    _add(cn, dn)
+
+        self._common_name_index = {k: sorted(v) for k, v in index.items()}
+        print(f"🧠 Built common-name index: {len(self._common_name_index)} phrases")
+        return self._common_name_index
+
+    def _resolve_datasets_by_common_name(self, query: str) -> List[str]:
+        """Resolve a query to dataset name(s) via the common-name index, preferring the longest phrase
+        match (e.g. "painted lady at night" → ["Vanessa_cardui"]). Returns [] when nothing matches."""
+        if not query or not query.strip():
+            return []
+        index = self._build_common_name_index()
+        if not index:
+            return []
+
+        def _normalized_query_variants(q: str) -> List[str]:
+            norm = re.sub(r"[_\-]+", " ", q.lower()).strip()
+            norm = re.sub(r"\s+", " ", norm)
+            variants = [norm]
+            for alias, replacements in _COMMON_NAME_QUERY_ALIASES.items():
+                if re.search(rf"\b{re.escape(alias)}\b", norm):
+                    for replacement in replacements:
+                        variants.append(re.sub(rf"\b{re.escape(alias)}\b", replacement, norm))
+            seen = set()
+            unique = []
+            for value in variants:
+                if value and value not in seen:
+                    seen.add(value)
+                    unique.append(value)
+            return unique
+
+        def _singular_pest_type(token: str) -> str:
+            if token in _PEST_TYPE_WORDS_SET:
+                if len(token) > 3 and token.endswith("ies"):
+                    return token[:-3] + "y"
+                if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+                    return token[:-1]
+                return token
+            return token
+
+        query_variants = _normalized_query_variants(query)
+
+        # Try longest n-grams first so a specific multi-word common name wins over a single word.
+        for query_variant in query_variants:
+            tokens = re.findall(r"[a-z]+", query_variant)
+            if not tokens:
+                continue
+            for size in (4, 3, 2, 1):
+                if size > len(tokens):
+                    continue
+                for i in range(len(tokens) - size + 1):
+                    phrase = " ".join(tokens[i:i + size])
+                    if phrase in index:
+                        return list(index[phrase])
+
+        # "golden beetle(s)" is too broad if treated as adjective + pest type: it can match many
+        # different golden-colored beetle common names. Keep it limited to the exact/common intended
+        # names unless the user provides a more specific common name.
+        for query_variant in query_variants:
+            if re.search(r"\bgolden\s+beetles?\b", query_variant):
+                matches = set()
+                for phrase in ("golden beetle", "golden tortoise beetle"):
+                    matches.update(index.get(phrase, []))
+                if matches:
+                    return sorted(matches)
+                return []
+
+        # Controlled partial phrase match: an adjective + pest type can match a longer common name,
+        # while generic "beetle" alone is still handled by the pest-type path. Very broad phrases with
+        # known ambiguity (e.g. "golden beetle") are handled above before this fallback.
+        for query_variant in query_variants:
+            tokens = re.findall(r"[a-z]+", query_variant)
+            if not tokens:
+                continue
+            query_terms = {_singular_pest_type(t) for t in tokens}
+            query_pest_terms = {t for t in query_terms if t in _PEST_TYPE_WORDS_SET}
+            query_specific_terms = {
+                t for t in query_terms
+                if len(t) >= 3 and t not in _PEST_TYPE_WORDS_SET and t not in _NON_SUBJECT_WORDS
+            }
+            if not query_specific_terms or (len(query_specific_terms) < 2 and not query_pest_terms):
+                continue
+            matches = set()
+            for common_phrase, dataset_names in index.items():
+                phrase_terms = {_singular_pest_type(t) for t in re.findall(r"[a-z]+", common_phrase)}
+                phrase_pest_terms = {t for t in phrase_terms if t in _PEST_TYPE_WORDS_SET}
+                if not query_specific_terms.issubset(phrase_terms):
+                    continue
+                if query_pest_terms and not query_pest_terms.intersection(phrase_pest_terms):
+                    continue
+                matches.update(dataset_names)
+            if matches:
+                return sorted(matches)
+        return []
+
+    def _unmatched_subject_words(self, query: str) -> List[str]:
+        """Return query words that look like a species subject but match no dataset/species in the catalog.
+
+        Returns [] when the query is only attributes (action/time/scene/etc.) or when any subject word
+        does match the catalog — so we only flag the clear "unknown species" case.
+        """
+        if not query or not query.strip():
+            return []
+        # A known common-name phrase (e.g. "painted lady" → Vanessa_cardui) means the subject IS in the
+        # catalog even though it doesn't appear in any dataset name; don't flag it.
+        if self._resolve_datasets_by_common_name(query):
+            return []
+        words = [w for w in re.findall(r"[a-z]+", query.lower()) if len(w) >= 3]
+        candidates = [w for w in words if w not in _NON_SUBJECT_WORDS]
+        if not candidates:
+            return []
+        dataset_names = [dn.lower() for dn in self.dataset_registry.datasets]
+        unmatched = []
+        for w in candidates:
+            w_sing = w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+            # Include common-name synonyms (e.g. "groundhog" → "woodchuck") so a known synonym is not flagged.
+            terms = {w, w_sing}
+            for t in (w, w_sing):
+                if t in _SPECIES_SYNONYMS:
+                    terms.add(_SPECIES_SYNONYMS[t])
+            if any(t in dn for dn in dataset_names for t in terms):
+                continue
+            unmatched.append(w)
+        # Only report when EVERY subject candidate is unmatched (avoid false alarms on partial matches).
+        if unmatched and len(unmatched) == len(candidates):
+            return unmatched
+        return []
+
+    def _compact_filters_for_llm(
+        self,
+        available_filters: Dict[str, List[str]],
+        query: str,
+        dataset: Optional[str] = None,
+    ) -> Dict[str, List[str]]:
+        """Build a compact filter vocabulary for the LLM (avoids sending thousands of pest tokens)."""
+        canonical_times = set()
+        for raw in (available_filters.get("times") or []) + (available_filters.get("time") or []):
+            canonical_times.update(_canonical_time_from_text(str(raw)))
+        if not canonical_times:
+            canonical_times = {"day", "night", "dawn", "dusk", "evening"}
+
+        compact: Dict[str, List[str]] = {
+            "category": ["wildlife", "domestic_animal", "livestock", "plants", "pests"],
+            "time": sorted(canonical_times),
+        }
+
+        species = set()
+        non_pest_types = {"wildlife", "domestic_animal", "livestock", "plants"}
+        for dn in self.dataset_registry.datasets:
+            if self.dataset_registry.infer_type_from_name(dn) in non_pest_types:
+                species.add(dn)
+
+        if query:
+            q_lower = query.lower()
+            words = [w for w in re.findall(r"[a-z_]+", q_lower) if len(w) >= 3]
+            for dn in self.dataset_registry.datasets:
+                dn_l = dn.lower()
+                if dn_l in q_lower or any(w in dn_l for w in words):
+                    species.add(dn)
+
+        if dataset:
+            for s in (available_filters.get("species") or [])[:80]:
+                if s:
+                    species.add(str(s))
+
+        compact["species"] = sorted(species)
+
+        for out_key, src_key, cap in [
+            ("action", "actions", 30),
+            ("season", "seasons", 10),
+            ("plant_state", "plant_states", 12),
+        ]:
+            vals = available_filters.get(out_key) or available_filters.get(src_key) or []
+            compact[out_key] = sorted({str(v).lower() for v in vals if v})[:cap]
+
+        return compact
+
+    def _species_implied_categories(self, species_filter: List[str]) -> set:
+        """Infer data-type categories from species/dataset names."""
+        cats = set()
+        dataset_names = self.dataset_registry.datasets
+        for s in species_filter:
+            if not s:
+                continue
+            sl = str(s).lower().strip().replace(" ", "_")
+            matched = False
+            for dn in dataset_names:
+                dn_l = dn.lower()
+                if dn_l == sl or dn_l.startswith(sl + "_") or dn_l.startswith(sl + "-"):
+                    cats.add(self.dataset_registry.infer_type_from_name(dn))
+                    matched = True
+                    break
+            if not matched:
+                for dn in dataset_names:
+                    if sl in dn.lower() or dn.lower() in sl:
+                        cats.add(self.dataset_registry.infer_type_from_name(dn))
+        return {c for c in cats if c}
+
+    def _dataset_matches_category(self, dataset_name: str, category_filter: List[str]) -> bool:
+        """True if the dataset's data type matches any requested category (handles 'animal' grouping)."""
+        if not category_filter:
+            return True
+        dataset_obj = self.dataset_registry.datasets.get(dataset_name)
+        dataset_category = (
+            dataset_obj.type.value.lower()
+            if dataset_obj is not None
+            else self.dataset_registry.infer_type_from_name(dataset_name)
+        )
+        category_mapping = {
+            "pest": ["pests"],
+            "pests": ["pests"],
+            "animal": ["wildlife", "domestic_animal", "livestock"],
+            "wildlife": ["wildlife"],
+            "domestic_animal": ["domestic_animal"],
+            "domestic": ["domestic_animal"],
+            "livestock": ["livestock"],
+            "plant": ["plants"],
+            "plants": ["plants"],
+        }
+        for c in category_filter:
+            cl = c.lower()
+            if dataset_category in category_mapping.get(cl, [cl]) or cl == dataset_category:
+                return True
+        return False
+
+    def _category_compatible(self, ui_categories: List[str], inferred_categories: set) -> bool:
+        """True when UI category selection does not conflict with species-implied categories."""
+        ui_norm = {c.lower().strip() for c in ui_categories if c}
+        inferred_norm = {c.lower().strip() for c in inferred_categories if c}
+        if not ui_norm or not inferred_norm:
+            return True
+        for ui in ui_norm:
+            if ui == "animal":
+                if inferred_norm & {"wildlife", "domestic_animal", "livestock"}:
+                    return True
+            elif ui in inferred_norm:
+                return True
+            elif ui == "plants" and "plants" in inferred_norm:
+                return True
+            elif ui == "pests" and "pests" in inferred_norm:
+                return True
+        return False
+
     def _extract_dataset_filters(self, dataset: Dataset) -> Dict[str, List[str]]:
         """Extract available filters from a dataset"""
         # Get images from the registry instead of accessing dataset.images
@@ -1827,6 +3011,7 @@ class MCPServer:
             "categories": [],
             "species": [],
             "times": [],
+            "time": [],
             "seasons": [],
             "actions": [],
             "plant_states": []
@@ -1861,16 +3046,27 @@ class MCPServer:
                             if two_word_compound not in filters["species"]:
                                 filters["species"].append(two_word_compound)
             # Add pest common_names so queries like "moth" match (common_names can be e.g. ["Raspberry crown moth", "moth"])
+            # Words we must NOT add as species (stopwords + action/description words that leak from long action text)
+            _species_stopwords = {
+                "the", "and", "or", "at", "in", "on", "to", "for", "of", "with", "within", "from", "an", "a",
+                "possibly", "appears", "stationary", "standing", "walking", "looking", "staring", "facing",
+                "camera", "enclosure", "animal", "appears", "toward", "directly", "resting", "moving", "eating",
+                "feeding", "sleeping", "hunting", "alert", "perching", "flying", "running", "sitting", "lowering",
+                "king", "pea", "tan", "thin",  # common false positives from substrings in "walking"/description
+            }
             for species_str in self._filter_strings(metadata.get("common_names")):
                 if not species_str:
                     continue
                 species_base = species_str.split("_")[0].split("-")[0].strip().lower()
-                if species_base and species_base not in filters["species"]:
+                if species_base and species_base not in filters["species"] and species_base not in _species_stopwords:
                     filters["species"].append(species_base)
                 # Multi-word common name: add each word as a filter (e.g. "moth" from "raspberry crown moth")
+                # Skip long description-like strings (e.g. "Animal appears stationary, possibly standing or walking...")
+                if len(species_str) > 60:
+                    continue
                 for word in species_str.replace("_", " ").replace("-", " ").split():
                     w = word.strip().lower()
-                    if w and len(w) >= 2 and w not in filters["species"]:
+                    if w and len(w) >= 2 and w not in filters["species"] and w not in _species_stopwords:
                         filters["species"].append(w)
             # Pest type words: add "moth"/"beetle" etc. when they appear as a word in collection/species/scientific_name (e.g. cabbage_moth)
             _pest_type_words = {"beetle", "butterfly", "moth", "wasp", "bee", "ant", "fly", "grasshopper", "dragonfly", "spider", "bug", "insect"}
@@ -1887,6 +3083,7 @@ class MCPServer:
             # Extract time, season, action, plant_state (each can be str or list)
             for t in self._filter_strings(metadata.get("time")):
                 filters["times"].append(t)
+                filters["time"].extend(sorted(_canonical_time_from_text(t)))
             for s in self._filter_strings(metadata.get("season")):
                 filters["seasons"].append(s)
             for a in self._filter_strings(metadata.get("action")):
@@ -1935,33 +3132,130 @@ class MCPServer:
         
         return filters
     
+    def _get_required_description_phrase(self, query: str, species_filter: List[str], description_query: Optional[str] = None) -> Optional[str]:
+        """When the query specifies a cultivar/variety (e.g. 'Cabernet Sauvignon grapes'), return the phrase that must appear in the result description to exclude other varieties (e.g. Syrah).
+        When the query is only a species name or its plural (e.g. 'raspberries' or 'raspberry'), return None so we return all items for that species."""
+        if not query or not query.strip():
+            return None
+        q = query.strip()
+        species_set = set()
+        species_words = set()  # all words that appear in any normalized species name (e.g. american, black, bear)
+        for s in (species_filter or []):
+            s = str(s).lower().strip().replace("_", " ")
+            if s:
+                species_set.add(s)
+                if s.endswith("s") and len(s) > 1:
+                    species_set.add(s[:-1])  # singular: raspberries -> raspberry
+                else:
+                    species_set.add(s + "s")  # common plural: raspberry -> raspberries
+                species_words.update(s.split())
+        words = q.split()
+        stop = {"the", "a", "an", "and", "or", "in", "on", "at", "for", "of", "with", "images", "pictures", "photos", "show", "find"}
+        # Behavior/time/scene words (e.g. "eating", "standing", "night") are handled by their own filters and must
+        # NOT become a required literal description phrase — otherwise "squirrel eating" would exclude images
+        # described as "foraging"/"feeding". Strip them (and punctuation) before forming the cultivar/variety phrase.
+        def _norm_word(w: str) -> str:
+            return re.sub(r"[^a-z]", "", w.lower())
+        remaining = [
+            w for w in words
+            if w.lower() not in species_set
+            and w.lower() not in stop
+            and _norm_word(w) not in _NON_SUBJECT_WORDS
+        ]
+        if not remaining:
+            return None
+        phrase = " ".join(remaining).strip()
+        if len(phrase) < 2:
+            return None
+        # Don't require phrase in description when the query is only a species synonym (e.g. "american bear" -> american_black_bear)
+        remaining_lower = {w.lower() for w in remaining}
+        if species_words and remaining_lower <= species_words:
+            return None
+        return phrase
+    
+    def _passes_description_required(self, result: Dict[str, Any], required_phrase: str) -> bool:
+        """True if the result's description or metadata text contains the required phrase (case-insensitive)."""
+        if not required_phrase or not required_phrase.strip():
+            return True
+        want = required_phrase.lower().strip()
+        meta = result.get("metadata") or {}
+        desc = (meta.get("description") or "")
+        if isinstance(desc, list):
+            desc = " ".join(str(x) for x in desc if x)
+        desc = str(desc).lower()
+        if want in desc:
+            return True
+        for key in ("species", "common_name", "scientific_name", "scene", "background"):
+            val = meta.get(key)
+            if val and want in str(val).lower():
+                return True
+        return False
+    
+    def _passes_action_strict(self, result: Dict[str, Any], action_filter: List[str]) -> bool:
+        """When user asked for a specific action (e.g. sleeping), exclude items that clearly have a different action (e.g. walking) or that describe awake/observing (e.g. cat at night observing). Do not infer sleeping from 'night'."""
+        if not action_filter:
+            return True
+        meta = result.get("metadata", {})
+        item_action = (meta.get("action") or "")
+        if isinstance(item_action, list):
+            item_action = " ".join(str(x).strip() for x in item_action if x).strip()
+        else:
+            item_action = str(item_action).strip()
+        item_description = (meta.get("description") or "")
+        item_canonical = _item_canonical_action(item_action, item_description)
+        for requested in action_filter:
+            if _action_filter_conflicts(requested, item_canonical):
+                return False
+        # When user asked for sleeping/resting, exclude items where description says awake/observing (e.g. cat at night observing)
+        if any(a.lower().strip() in ("sleeping", "resting") for a in action_filter):
+            if _description_indicates_awake_or_observing(item_description):
+                return False
+        return True
+    
     def _passes_plant_state_strict(self, result: Dict[str, Any], plant_state_filter: List[str]) -> bool:
         """When user asked for a specific plant_state (e.g. ripe/unripe), keep items that match.
-        For 'ripe': exclude mixed; for 'unripe': allow mixed if description mentions unripe/developing fruit.
+        For 'ripe': exclude mixed unless description says ripe. For 'unripe': allow mixed if description mentions unripe.
         """
         if not plant_state_filter:
             return True
+        # Normalize to list (in case passed as string)
+        if isinstance(plant_state_filter, str):
+            plant_state_filter = [plant_state_filter.strip()] if plant_state_filter.strip() else []
+        if not plant_state_filter:
+            return True
         meta = result.get("metadata", {})
-        ps_val = meta.get("plant_state")
+        ps_val = meta.get("plant_state") or meta.get("plant_states")
         if isinstance(ps_val, list):
             item_ps = " ".join(str(x).strip() for x in ps_val if x).strip().lower()
         else:
             item_ps = (str(ps_val).strip().lower() if ps_val else "")
-        desc = (meta.get("description") or "").lower()
+        desc = (meta.get("description") or result.get("description") or "").lower()
         for requested in plant_state_filter:
             r = requested.lower().strip()
-            if r not in ["ripe", "ripening", "unripe", "mature", "green", "red", "blooming", "fruiting"]:
+            if r not in ["ripe", "ripening", "unripe", "mature", "green", "red", "blooming", "fruiting", "buds", "bud"]:
                 continue
-            # ---- Unripe: allow if plant_state is unripe OR description caption mentions unripe ----
+            # ---- Unripe: accept immediately if metadata says unripe, or blooming/buds, or description mentions unripe ----
             if r == "unripe":
                 if item_ps == "unripe":
                     return True
-                # If "unripe" appears anywhere in the description caption, include the image
-                if "unripe" in desc:
+                # Unripe should translate to early growth stages: blooming, buds
+                if item_ps in ("blooming", "buds", "bud"):
                     return True
+                # If "unripe" appears anywhere in the description caption, include the image
+                if "unripe" in desc or "unripened" in desc:
+                    return True
+                # When metadata has no plant_state, accept if description clearly describes unripe fruit/berries
+                if not item_ps or not item_ps.strip():
+                    unripe_desc_phrases = [
+                        "unripe berr", "unripe fruit", "unripe raspberr", "green berr", "green fruit",
+                        "developing fruit", "developing berr", "developing raspberr", "immature",
+                    ]
+                    if any(p in desc for p in unripe_desc_phrases):
+                        return True
+                # Allow "mixed" for unripe when description mentions unripe (image has unripe berries even if some ripe too)
                 if item_ps == "mixed":
                     unripe_phrases = [
-                        "unripe berr", "unripe fruit", "unripe raspberr", "developing fruit",
+                        "unripe berr", "unripe fruit", "unripe raspberr", "unripe strawberr", "developing fruit",
                         "developing berr", "developing raspberr", "green fruit", "green berr",
                         "young raspberr", "young fruit", "young berr", "unripe berries",
                     ]
@@ -1972,7 +3266,15 @@ class MCPServer:
                     if any(p in desc for p in ["developing fruit", "developing berr", "green fruit"]):
                         return True
                 continue
-            # ---- Ripe: exclude mixed (user wants ripe-only); allow ripe/ripening with care ----
+            # ---- Ripe: allow "mixed" if description mentions ripe (image has ripe berries even if some unripe too) ----
+            if r == "ripe" and item_ps == "mixed":
+                if _description_has_ripe_phrase(desc):
+                    return True
+            # Ripe: exclude when description says unripe but has no ripe (e.g. "flowers and buds and unripe berries")
+            if r == "ripe" and ("unripe" in desc or "unripened" in desc):
+                if not re.search(r"\bripe\b", desc) and not _description_has_ripe_phrase(desc):
+                    return False
+            # Exclude mixed for ripe only when description doesn't suggest ripe content
             if item_ps == "mixed":
                 return False
             # Ripening ≠ ripe: when user asks for "ripe", exclude items that are only "ripening"
@@ -1991,16 +3293,14 @@ class MCPServer:
                 ]
                 if any(p in desc for p in mixed_phrases):
                     return False
-                if item_ps == "fruiting" and not any(
-                    p in desc for p in ["ripe raspberr", "ripe berry", "ripe berries", "ripe fruit", "red ripe", "fully ripe", "mature berry"]
-                ):
+                if item_ps == "fruiting" and not _description_has_ripe_phrase(desc):
                     return False
             if item_ps == r:
                 return True
             item_ps_words = (item_ps.split() if item_ps else [])
             if r in item_ps_words:
                 return True
-            if r == "ripe" and any(p in desc for p in ["ripe raspberr", "ripe berry", "ripe berries", "ripe fruit", "red ripe", "fully ripe", "mature berry"]):
+            if r == "ripe" and _description_has_ripe_phrase(desc):
                 return True
         return False
     
@@ -2031,41 +3331,64 @@ class MCPServer:
             total_filter_checks += 1
             item_species = _metadata_str(metadata.get("species", "")).lower().strip()
             item_collection = _metadata_str(result.get("collection", "")).lower().strip()
+            # The species filter is often the DATASET name (a common name like "coyote"), while metadata.species
+            # may hold the scientific name (e.g. "Canis latrans"). Match against all of the image's identity
+            # fields so a result that genuinely belongs to the queried dataset scores as a strong match.
+            item_dataset = _metadata_str(result.get("dataset", "")).lower().strip()
+            item_scientific = _metadata_str(metadata.get("scientific_name", "")).lower().strip()
+            item_common = _metadata_str(metadata.get("common_name", "")).lower().strip()
+            item_common_names = [
+                str(c).lower().strip()
+                for c in (metadata.get("common_names") or [])
+                if c and str(c).strip()
+            ]
+            # Exact-identity values: an exact (normalized) match against any of these is a perfect species match.
+            identity_values = [v for v in [item_dataset, item_collection, item_scientific, item_common] if v] + item_common_names
+            identity_norm = {v.replace("_", "").replace("-", "").replace(" ", "") for v in identity_values}
             best_match = 0.0
             for species_filter in filters["species"]:
                 species_lower = species_filter.lower().strip()
+                species_norm = species_lower.replace("_", "").replace("-", "").replace(" ", "")
                 # Exact match in metadata.species is strongest
-                if item_species == species_lower:
+                if item_species and item_species == species_lower:
                     import hashlib
                     item_id = result.get('id', '')
                     id_hash = int(hashlib.md5(item_id.encode()).hexdigest()[:2], 16)
                     # Exact match: 0.98 to 1.0 (perfect match!)
                     best_match = max(best_match, 0.98 + (id_hash % 3) / 100.0)
                     matched_filters += 1
-                elif item_collection == species_lower:
-                    best_match = max(best_match, 0.94)
+                elif species_norm and (species_norm in identity_norm or species_norm == item_species.replace("_", "").replace("-", "").replace(" ", "")):
+                    # Filter matches the dataset/collection/common/scientific name (e.g. dataset-name search) — perfect match.
+                    import hashlib
+                    item_id = result.get('id', '')
+                    id_hash = int(hashlib.md5(item_id.encode()).hexdigest()[:2], 16)
+                    best_match = max(best_match, 0.97 + (id_hash % 3) / 100.0)
                     matched_filters += 1
-                elif item_species.startswith(species_lower + "_") or item_collection.startswith(species_lower + "_"):
+                elif (item_species.startswith(species_lower + "_") or item_collection.startswith(species_lower + "_")
+                      or item_dataset.startswith(species_lower + "_")):
                     best_match = max(best_match, 0.90)
                     matched_filters += 1
                 else:
-                    # Normalized match (handles variations)
-                    species_norm = species_lower.replace("_", "").replace("-", "")
-                    item_species_norm = item_species.replace("_", "").replace("-", "")
-                    item_collection_norm = item_collection.replace("_", "").replace("-", "")
-                    if species_norm == item_species_norm or species_norm == item_collection_norm:
+                    # Normalized substring match (handles variations like compound common names)
+                    if species_norm and any(species_norm in v or v in species_norm for v in identity_norm if v):
                         best_match = max(best_match, 0.87)
                         matched_filters += 1
             if best_match > 0:
                 match_scores.append(best_match)
         
-        # Check time match quality
+        # Check time match quality (daytime requested => exclude items that indicate night)
         if filters.get("time"):
             total_filter_checks += 1
             item_time = _metadata_str(metadata.get("time", "")).lower().strip()
+            item_desc_lower = _metadata_str(metadata.get("description", "")).lower()
             best_match = 0.0
             for time_filter in filters["time"]:
                 time_lower = time_filter.lower().strip()
+                is_day_request = any(x in time_lower for x in ("day", "morning", "afternoon", "daytime"))
+                item_is_night = ("night" in item_time or "nighttime" in item_time) and "daytime" not in item_time
+                item_desc_says_night = "night" in item_desc_lower and "daytime" not in item_desc_lower
+                if is_day_request and (item_is_night or item_desc_says_night):
+                    continue  # user asked for day but item is night — do not count time match
                 if item_time == time_lower:
                     import hashlib
                     item_id = result.get('id', '')
@@ -2075,6 +3398,11 @@ class MCPServer:
                 elif time_lower in item_time or item_time in time_lower:
                     best_match = max(best_match, 0.91)
                     matched_filters += 1
+                elif is_day_request and any(x in item_time or x in item_desc_lower for x in ("day", "daytime", "morning", "afternoon")):
+                    # e.g. filter "during daytime" vs item "Daytime (11:40 AM)"
+                    if not item_is_night and not item_desc_says_night:
+                        best_match = max(best_match, 0.91)
+                        matched_filters += 1
             if best_match > 0:
                 match_scores.append(best_match)
         
@@ -2232,12 +3560,9 @@ class MCPServer:
                     desc_score = 0.91
                     if item_plant_state in ("mixed", "fruiting") and plant_state_lower in ("ripe", "unripe", "mature", "green", "red"):
                         desc_score = 0.68  # so exact plant_state=ripe still sorts first
-                    # For "ripe": require whole-word or explicit phrases so "ripening" does not match
+                    # For "ripe": require whole-word or explicit phrases so "unripe berries" / "ripening" do not match
                     if plant_state_lower == "ripe":
-                        import re as _re
-                        ripe_ok = (_re.search(r"\bripe\b", item_description) and "ripening" not in item_description) or any(
-                            p in item_description for p in ["ripe raspberr", "ripe berry", "ripe berries", "ripe fruit", "red ripe", "fully ripe", "mature berry"]
-                        )
+                        ripe_ok = (re.search(r"\bripe\b", item_description) and "ripening" not in item_description) or _description_has_ripe_phrase(item_description)
                         if ripe_ok:
                             best_match = max(best_match, desc_score)
                             matched_filters += 1
@@ -2274,8 +3599,8 @@ class MCPServer:
             else:
                 avg_match_quality = sum(match_scores) / len(match_scores)
             
-            # Calculate filter match ratio (how many filters matched)
-            match_ratio = matched_filters / total_filter_checks if total_filter_checks > 0 else 1.0
+            # Calculate filter match ratio (how many filters matched); cap at 1.0 so full match => high confidence
+            match_ratio = min(1.0, matched_filters / total_filter_checks if total_filter_checks > 0 else 1.0)
             
             # Base confidence: start high for good matches, penalize for missing filters
             if match_ratio == 1.0:
@@ -2516,6 +3841,7 @@ class MCPServer:
         port = port or MCP_CONFIG.get("mcp_port", 8188)
         
         print(f"🚀 Starting {self.name} on {host}:{port}")
+        print(f"✅ LLM search: broad species queries (e.g. 'raspberries') return full dataset — no description filter")
         all_tools = self.tool_registry.get_all_tools()
         tool_names = list(all_tools.keys())
         print(f"🔧 Available tools ({len(tool_names)}): {', '.join(tool_names)}")
