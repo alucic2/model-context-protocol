@@ -1394,12 +1394,21 @@ class MCPServer:
             _bad_substring_terms = _GENERIC_ADJECTIVE_WORDS | {"ripe", "unripe", "mature", "immature"}
             _species_before = query_understanding.filters.get("species") or []
             if _species_before:
-                _species_after = [
-                    s for s in _species_before
-                    if str(s).lower().strip() not in _bad_substring_terms or _query_has_whole_word(str(s))
-                ]
+                _species_after = []
+                for s in _species_before:
+                    s_norm = str(s).lower().strip()
+                    # A bare color/quality adjective ("white", "green", "spotted") is never a standalone
+                    # species — drop it even if the user typed it (it would wrongly match e.g. "cabbage
+                    # white" butterflies or "white_cottontail"). Multi-word names like "red leaf lettuce"
+                    # contain a space and are kept.
+                    if s_norm in _GENERIC_ADJECTIVE_WORDS and " " not in s_norm:
+                        continue
+                    # Other substring-prone terms are kept only if typed as a standalone word.
+                    if s_norm in _bad_substring_terms and not _query_has_whole_word(s_norm):
+                        continue
+                    _species_after.append(s)
                 if _species_after != _species_before:
-                    print(f"🧠 Removed substring-only species filter(s): {sorted(set(_species_before) - set(_species_after))}")
+                    print(f"🧠 Removed adjective/substring-only species filter(s): {sorted(set(_species_before) - set(_species_after))}")
                     query_understanding.filters["species"] = _species_after
             _plant_state_before = query_understanding.filters.get("plant_state") or []
             if _plant_state_before:
@@ -1598,6 +1607,26 @@ class MCPServer:
                                 "error": "This species (rabbit / cottontail) is not available in the collection.",
                                 "searched_datasets": [],
                             }
+                # "<color/quality adjective> <pest type>" that didn't resolve to a real catalog species
+                # (e.g. "white fly", "brown beetle") is a request for a SPECIFIC pest we don't have. Don't
+                # fall back to injecting the bare pest type (which would return every fly/beetle, including
+                # unrelated "cabbage white" butterflies). Report it as not in the catalog instead. A real
+                # colored pest (e.g. "golden tortoise beetle") would already have resolved via cn_injected.
+                if not query_understanding.filters.get("species") and not cn_injected:
+                    _tok = re.findall(r"[a-z]+", query_lower)
+                    _spec = {t for t in _tok if len(t) >= 3 and t not in _PEST_TYPE_WORDS_SET and t not in _NON_SUBJECT_WORDS}
+                    _pst = {t for t in _tok if t in _PEST_TYPE_WORDS_SET or (t.rstrip("s") in _PEST_TYPE_WORDS_SET)}
+                    if _pst and _spec and _spec.issubset(_GENERIC_ADJECTIVE_WORDS):
+                        pretty = query.strip()
+                        print(f"🧠 '{pretty}' is a generic-adjective + pest-type with no catalog match → not in catalog")
+                        return {
+                            "query": query,
+                            "llm_understanding": query_understanding,
+                            "results": [],
+                            "total_count": 0,
+                            "error": f"'{pretty}' is not in our catalog yet. Try a different species, or pick a Category to browse what's available.",
+                            "searched_datasets": [],
+                        }
                 # Pest type words: ensure "beetle", "butterfly", "wasp", "moth", "aphid", "stink bug", etc.
                 # are in the species filter when the query mentions them so search matches pest images via
                 # common_names (e.g. ["French Paper Wasp", "wasp"], ["soybean aphid", "aphid"]).
