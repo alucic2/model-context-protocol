@@ -1106,6 +1106,18 @@ class WebInterface:
         try:
             metadata = result.get("metadata", {})
             result_id = result.get("id", "")
+
+            # Extension hint from original_filename so id-based fallbacks don't hardcode .jpg.
+            # Disk files are often renamed to match the id but keep their real extension
+            # (e.g. id "carrot_001" → file "carrot_001.png", original_filename "007_image.png").
+            _known_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+            _orig_ext = ""
+            _of = metadata.get("original_filename") or ""
+            if _of:
+                _candidate_ext = Path(str(_of)).suffix.lower()
+                if _candidate_ext in _known_exts:
+                    _orig_ext = _candidate_ext
+            _id_fallback_ext = _orig_ext or ".jpg"
             
             # Strategy: Try multiple filename patterns in order of likelihood
             # For coyote: id is "coyote_001" and file is "coyote_001.jpg" (id matches filename)
@@ -1133,8 +1145,8 @@ class WebInterface:
                 # (server might have it even if local check fails)
                 # But only if id looks like a filename pattern (contains underscore or matches common patterns)
                 if "_" in result_id or result_id.replace("_", "").replace("-", "").isalnum():
-                    print(f"⚠️  Image not found locally for id {result_id}, using .jpg (likely on server)")
-                    return f"/images/{result_id}.jpg"
+                    print(f"⚠️  Image not found locally for id {result_id}, using {_id_fallback_ext} (likely on server)")
+                    return f"/images/{result_id}{_id_fallback_ext}"
             
             # Priority 3: Try original_filename from metadata (for datasets like red_leaf where id doesn't match filename)
             # original_filename contains the actual filename from the source dataset
@@ -1192,10 +1204,10 @@ class WebInterface:
                         print(f"✅ Found image using mcp_id: {potential_filename}")
                         return f"/images/{potential_filename}"
             
-            # Priority 6: Fallback to id with .jpg (most common extension)
+            # Priority 6: Fallback to id with the original file's extension (or .jpg if unknown)
             if result_id:
-                print(f"⚠️  Using id as fallback: {result_id}.jpg")
-                return f"/images/{result_id}.jpg"
+                print(f"⚠️  Using id as fallback: {result_id}{_id_fallback_ext}")
+                return f"/images/{result_id}{_id_fallback_ext}"
             
             # If no image info, return placeholder
             print(f"❌ No image identifier found for result: {result.get('id', 'unknown')}")

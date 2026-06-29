@@ -82,6 +82,16 @@ _PEST_TYPE_WORDS_SET = {
     "weevil", "weevils", "aphid", "aphids", "caterpillar", "caterpillars", "midge", "midges",
 }
 
+# Larval / life-stage group nouns users search as a single word (e.g. "caterpillar", "cutworm").
+# These also appear in _PEST_TYPE_WORDS_SET but should still resolve via head-noun common-name lookup
+# (last word of "saddleback caterpillar", "black cutworm", etc.). cutworm/maggot are not in the pest-type
+# set; caterpillar is — which is why bare "caterpillar" failed while cutworm/maggot worked.
+_HEAD_NOUN_SEARCH_WORDS = {
+    "caterpillar", "caterpillars", "cutworm", "cutworms", "maggot", "maggots",
+    "armyworm", "armyworms", "hornworm", "hornworms", "borer", "borers",
+    "looper", "loopers", "grub", "grubs", "webworm", "webworms", "sawfly", "sawflies",
+}
+
 # User-facing pest common-name aliases that may not be present literally in metadata.
 # These are expanded only for common-name lookup, so they do not broaden generic pest-type searches.
 _COMMON_NAME_QUERY_ALIASES = {
@@ -91,6 +101,12 @@ _COMMON_NAME_QUERY_ALIASES = {
     "lady bugs": ("lady beetles", "ladybird beetles"),
     "ladybird": ("lady beetle", "ladybird beetle"),
     "ladybirds": ("lady beetles", "ladybird beetles"),
+    # Common misspellings of "caterpillar" so the search still finds it.
+    "caterpiller": ("caterpillar",),
+    "caterpillers": ("caterpillars",),
+    "caterpiler": ("caterpillar",),
+    "catterpillar": ("caterpillar",),
+    "catepillar": ("caterpillar",),
 }
 
 
@@ -2849,6 +2865,39 @@ class MCPServer:
                 if query_pest_terms and not query_pest_terms.intersection(phrase_pest_terms):
                     continue
                 matches.update(dataset_names)
+            if matches:
+                return sorted(matches)
+
+        # Single group head-noun match: a lone subject noun that only appears as the LAST word of
+        # multi-word common names (e.g. "cutworm" → "black cutworm", "caterpillar" → "saddleback
+        # caterpillar", "maggot" → "apple maggot", "armyworm" → "beet armyworm"). Requiring the query
+        # word to be the head (last) word avoids adjectives like "golden"/"common"/"eastern" matching
+        # everything. Larval group nouns in _HEAD_NOUN_SEARCH_WORDS are included even when they are also
+        # in _PEST_TYPE_WORDS_SET (e.g. caterpillar).
+        def _sing_head(w: str) -> str:
+            return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+
+        for query_variant in query_variants:
+            tokens = re.findall(r"[a-z]+", query_variant)
+            head_candidates = []
+            specific = [
+                t for t in tokens
+                if len(t) >= 4 and t not in _PEST_TYPE_WORDS_SET and t not in _NON_SUBJECT_WORDS
+            ]
+            if len(specific) == 1:
+                head_candidates.append(_sing_head(specific[0]))
+            elif len(tokens) == 1:
+                t0 = _sing_head(tokens[0])
+                if t0 in _HEAD_NOUN_SEARCH_WORDS or tokens[0] in _HEAD_NOUN_SEARCH_WORDS:
+                    head_candidates.append(t0)
+            if not head_candidates:
+                continue
+            head = head_candidates[0]
+            matches = set()
+            for common_phrase, dataset_names in index.items():
+                ph_tokens = re.findall(r"[a-z]+", common_phrase)
+                if ph_tokens and _sing_head(ph_tokens[-1]) == head:
+                    matches.update(dataset_names)
             if matches:
                 return sorted(matches)
         return []
