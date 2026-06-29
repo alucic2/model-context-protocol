@@ -107,6 +107,20 @@ _COMMON_NAME_QUERY_ALIASES = {
     "caterpiler": ("caterpillar",),
     "catterpillar": ("caterpillar",),
     "catepillar": ("caterpillar",),
+    # Spaced spellings of "whitefly" / "mealybug" so they hit the (single-token) common-name index.
+    "white fly": ("whitefly",),
+    "white flies": ("whitefly",),
+    "meal bug": ("mealybug",),
+    "meal bugs": ("mealybug",),
+}
+
+
+# Generic color/quality adjectives. On their own (e.g. "white" + "fly") they are too broad to drive a
+# partial pest common-name match, so the resolver requires an exact phrase match in that case.
+_GENERIC_ADJECTIVE_WORDS = {
+    "white", "black", "brown", "gray", "grey", "red", "green", "blue", "yellow", "orange",
+    "golden", "gold", "silver", "common", "giant", "large", "small", "little", "great",
+    "lesser", "spotted", "striped", "banded", "dark", "pale", "tiny",
 }
 
 
@@ -149,7 +163,7 @@ _NON_SUBJECT_WORDS = {
     "spring", "summer", "fall", "autumn", "winter",
     # scene / setting
     "field", "forest", "water", "mountain", "garden", "farm", "meadow", "indoor", "outdoor", "tree",
-    "trees", "snow", "grass", "road", "sky", "barn", "pen", "enclosure", "cage", "bush", "leaves",
+    "trees", "snow", "grass", "road", "sky", "barn", "pen", "enclosure", "cage", "bush", "leaf", "leaves",
     "foliage", "background",
     # plant state / descriptors
     "ripe", "unripe", "mature", "immature", "blooming", "flowering", "fruiting", "green", "red",
@@ -1371,6 +1385,40 @@ class MCPServer:
             # LLM sometimes omits it; without it we return all images and strict filter never runs
             query_lower = query.lower()
 
+            def _query_has_whole_word(term: str) -> bool:
+                return bool(re.search(rf"\b{re.escape(str(term or '').lower().strip())}\b", query_lower))
+
+            # The metadata fallback can match filter values as substrings. For terms that are also common
+            # prefixes inside species names (e.g. "green" in "greenhouse whitefly"), discard them unless the
+            # user actually typed them as standalone words.
+            _bad_substring_terms = _GENERIC_ADJECTIVE_WORDS | {"ripe", "unripe", "mature", "immature"}
+            _species_before = query_understanding.filters.get("species") or []
+            if _species_before:
+                _species_after = [
+                    s for s in _species_before
+                    if str(s).lower().strip() not in _bad_substring_terms or _query_has_whole_word(str(s))
+                ]
+                if _species_after != _species_before:
+                    print(f"🧠 Removed substring-only species filter(s): {sorted(set(_species_before) - set(_species_after))}")
+                    query_understanding.filters["species"] = _species_after
+            _plant_state_before = query_understanding.filters.get("plant_state") or []
+            if _plant_state_before:
+                _plant_state_after = [
+                    ps for ps in _plant_state_before
+                    if str(ps).lower().strip() not in _bad_substring_terms or _query_has_whole_word(str(ps))
+                ]
+                if _plant_state_after != _plant_state_before:
+                    print(f"🧠 Removed substring-only plant_state filter(s): {sorted(set(_plant_state_before) - set(_plant_state_after))}")
+                    query_understanding.filters["plant_state"] = _plant_state_after
+            if query_understanding.entities:
+                _entities_before = list(query_understanding.entities)
+                query_understanding.entities = [
+                    e for e in _entities_before
+                    if str(e).lower().strip() not in _bad_substring_terms or _query_has_whole_word(str(e))
+                ]
+                if query_understanding.entities != _entities_before:
+                    print(f"🧠 Removed substring-only entity/entities: {sorted(set(_entities_before) - set(query_understanding.entities))}")
+
             # Collapse an over-expanded species filter. The rule-based matcher can expand a bare group word
             # like "grasshopper" into every matching common name (e.g. 60 "* grasshopper" species). Their
             # shared descriptor segments ("eastern", "bird") then wrongly match wildlife datasets (skunk,
@@ -1550,13 +1598,13 @@ class MCPServer:
                                 "error": "This species (rabbit / cottontail) is not available in the collection.",
                                 "searched_datasets": [],
                             }
-                # Pest type words: ensure "beetle", "butterfly", "wasp", "moth", "stink bug", etc. are in species filter when query mentions them
-                # so search matches pest images via common_names (e.g. ["French Paper Wasp", "wasp"])
-                _PEST_TYPE_WORDS = [
-                    "beetle", "beetles", "butterfly", "butterflies", "moth", "moths",
-                    "wasp", "wasps", "bee", "bees", "ant", "ants", "fly", "flies",
-                    "grasshopper", "grasshoppers", "dragonfly", "dragonflies",
-                    "spider", "spiders", "stink bug", "stink bugs", "true bug", "bugs", "insect", "insects",
+                # Pest type words: ensure "beetle", "butterfly", "wasp", "moth", "aphid", "stink bug", etc.
+                # are in the species filter when the query mentions them so search matches pest images via
+                # common_names (e.g. ["French Paper Wasp", "wasp"], ["soybean aphid", "aphid"]).
+                # Derived from the module-level _PEST_TYPE_WORDS_SET (so aphid/weevil/midge/caterpillar are
+                # included and the two lists can't drift) plus multi-word phrases handled specially.
+                _PEST_TYPE_WORDS = sorted(_PEST_TYPE_WORDS_SET) + [
+                    "stink bug", "stink bugs", "true bug", "true bugs",
                 ]
                 query_species_list = query_understanding.filters.get("species") or []
                 species_set = {s.lower().strip() for s in query_species_list}
@@ -1565,7 +1613,12 @@ class MCPServer:
                 if not cn_injected:
                     for type_word in _PEST_TYPE_WORDS:
                         type_lower = type_word.lower()
-                        type_singular = type_lower.rstrip("s") if type_lower.endswith("s") and len(type_lower) > 1 else type_lower
+                        if len(type_lower) > 4 and type_lower.endswith("ies"):
+                            type_singular = type_lower[:-3] + "y"
+                        elif type_lower.endswith("s") and len(type_lower) > 1 and not type_lower.endswith("ss"):
+                            type_singular = type_lower[:-1]
+                        else:
+                            type_singular = type_lower
                         # Match WHOLE words/phrases only, so "bug" does not match inside "ladybug".
                         if re.search(rf"\b{re.escape(type_lower)}\b", query_lower) or re.search(rf"\b{re.escape(type_singular)}\b", query_lower):
                             if type_singular not in species_set and type_lower not in species_set:
@@ -1575,6 +1628,48 @@ class MCPServer:
                                     print(f"   ✅ Injected species (pest type from query): '{type_singular}'")
                 if query_species_list != (query_understanding.filters.get("species") or []):
                     query_understanding.filters["species"] = sorted(list(set(query_species_list)))
+                # If the query clearly names a pest group ("aphids on a leaf"), context words like
+                # "leaf" should not leave plant datasets (e.g. red_leaf) in the species filter.
+                _species_after_pest = query_understanding.filters.get("species") or []
+                _generic_pest_terms = {
+                    s.lower().strip()
+                    for s in _species_after_pest
+                    if s and (
+                        s.lower().strip() in _PEST_TYPE_WORDS_SET
+                        or s.lower().strip().rstrip("s") in _PEST_TYPE_WORDS_SET
+                    )
+                }
+                if _generic_pest_terms and len(_species_after_pest) > 1:
+                    _filtered_species = []
+                    _dropped_species = []
+                    _non_pest_types_for_cleanup = {"wildlife", "domestic_animal", "livestock", "plants"}
+                    for s in _species_after_pest:
+                        s_key = str(s).lower().strip()
+                        dataset_name = dataset_names_lower.get(s_key)
+                        if dataset_name and self.dataset_registry.infer_type_from_name(dataset_name) in _non_pest_types_for_cleanup:
+                            _dropped_species.append(s)
+                            continue
+                        _filtered_species.append(s)
+                    if _dropped_species:
+                        query_understanding.filters["species"] = sorted(set(_filtered_species))
+                        print(f"🧠 Dropped context plant/non-pest species from pest query: {_dropped_species}")
+
+            # Goat tail position (re-evaluate AFTER species resolution). The earlier pass runs before species
+            # injection, so for queries like "goats with tail up" — where the LLM leaves species empty and we
+            # resolve "goat" server-side — the tail filter would otherwise never be set.
+            if query and not query_understanding.filters.get("tail_positions"):
+                _species_for_tail = {s.lower().strip().replace(" ", "_") for s in (query_understanding.filters.get("species") or [])}
+                _is_goat = any(s == "goat" or s.startswith("goat_") for s in _species_for_tail)
+                if _is_goat and "tail" in query_lower:
+                    if "tail up" in query_lower or re.search(r"\btail\b.*\bup\b", query_lower):
+                        query_understanding.filters["tail_positions"] = ["up"]
+                        print(f"   ✅ Injected tail_positions: ['up'] from query (post-species)")
+                    elif "tail down" in query_lower or re.search(r"\btail\b.*\bdown\b", query_lower):
+                        query_understanding.filters["tail_positions"] = ["down"]
+                        print(f"   ✅ Injected tail_positions: ['down'] from query (post-species)")
+                    elif re.search(r"\b(undetermined|undetermend|indeterminate|unknown|not\s+visible|unclear|obscured)\b", query_lower):
+                        query_understanding.filters["tail_positions"] = ["undetermined"]
+                        print(f"   ✅ Injected tail_positions: ['undetermined'] from query (post-species)")
 
             # Time: inject canonical buckets when the query mentions time but the LLM omitted it
             if query and not query_understanding.filters.get("time"):
@@ -2122,18 +2217,38 @@ class MCPServer:
                         filtered_results = [r for r in filtered_results if self._passes_action_strict(r, action_filter_list)]
                         if before != len(filtered_results):
                             print(f"🧠 Action strict filter (single dataset): kept {len(filtered_results)} of {before} results (requested: {action_filter_list})")
+                    tail_filter_list = query_understanding.filters.get("tail_positions") or []
+                    if tail_filter_list:
+                        before = len(filtered_results)
+                        filtered_results = [r for r in filtered_results if self._passes_tail_strict(r, tail_filter_list)]
+                        if before != len(filtered_results):
+                            print(f"🧠 Tail-position strict filter (single dataset): kept {len(filtered_results)} of {before} results (requested: {tail_filter_list})")
                     # When query specifies a cultivar/variety (e.g. "Cabernet Sauvignon grapes"), require description to contain it so we exclude other varieties (e.g. Syrah).
                     # For broad species-only queries (e.g. "raspberries") _get_required_description_phrase returns None so we don't shrink the set.
-                    req_phrase = self._get_required_description_phrase(
-                        query,
-                        query_understanding.filters.get("species") or [],
-                        getattr(query_understanding, "description_query", None),
-                    )
+                    # Skip when we already filtered by tail_positions/scene — those used metadata; requiring a
+                    # literal phrase (e.g. "tail undetermined") would wrongly exclude valid items.
+                    req_phrase = None
+                    if not query_understanding.filters.get("tail_positions") and not query_understanding.filters.get("scene"):
+                        req_phrase = self._get_required_description_phrase(
+                            query,
+                            query_understanding.filters.get("species") or [],
+                            getattr(query_understanding, "description_query", None),
+                        )
                     # When species was resolved from a common name (e.g. "golden beetle" → datasets), the query
                     # words ARE the common name and were already used to pick datasets. Don't also require them
                     # literally in the description (image descriptions rarely repeat the common name verbatim).
                     if req_phrase and cn_injected:
                         print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                        req_phrase = None
+                    # Generic pest-group searches (e.g. "aphids on soybean leaves" → species ["aphid"]): the
+                    # leftover host/descriptor words ("soybean") shouldn't be forced into the description, since
+                    # pest images rarely repeat the host plant verbatim — that would drop all matches.
+                    _sp_for_phrase = [s.lower().strip() for s in (query_understanding.filters.get("species") or [])]
+                    if req_phrase and _sp_for_phrase and all(
+                        (s in _PEST_TYPE_WORDS_SET or (s + "s") in _PEST_TYPE_WORDS_SET or s.rstrip("s") in _PEST_TYPE_WORDS_SET)
+                        for s in _sp_for_phrase
+                    ):
+                        print(f"🧠 Skipping description phrase '{req_phrase}' (generic pest-group search)")
                         req_phrase = None
                     # Explicit: for raspberry dataset, never require "raspberries" in description — return all images.
                     if req_phrase and str(req_phrase).lower().strip() == "raspberries" and str(dataset).lower() == "raspberry":
@@ -2337,6 +2452,12 @@ class MCPServer:
                     all_results = [r for r in all_results if self._passes_action_strict(r, action_filter_list)]
                     if before != len(all_results):
                         print(f"🧠 Action strict filter: kept {len(all_results)} of {before} results (requested: {action_filter_list})")
+                tail_filter_list = query_understanding.filters.get("tail_positions") or []
+                if tail_filter_list:
+                    before = len(all_results)
+                    all_results = [r for r in all_results if self._passes_tail_strict(r, tail_filter_list)]
+                    if before != len(all_results):
+                        print(f"🧠 Tail-position strict filter: kept {len(all_results)} of {before} results (requested: {tail_filter_list})")
                 # When query specifies a cultivar/variety (e.g. "Cabernet Sauvignon grapes"), require description to contain it
                 # Skip when we already filtered by tail_positions or scene — adapter used metadata; requiring phrase would exclude valid items (e.g. "goats field" vs "goats in a field").
                 req_phrase = None
@@ -2349,6 +2470,15 @@ class MCPServer:
                 # Species resolved from a common name: don't also require those words in the description.
                 if req_phrase and cn_injected:
                     print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                    req_phrase = None
+                # Generic pest-group searches (e.g. "aphids on soybean leaves" → species ["aphid"]): don't force
+                # leftover host/descriptor words ("soybean") into the description or every match gets dropped.
+                _sp_for_phrase = [s.lower().strip() for s in (query_understanding.filters.get("species") or [])]
+                if req_phrase and _sp_for_phrase and all(
+                    (s in _PEST_TYPE_WORDS_SET or (s + "s") in _PEST_TYPE_WORDS_SET or s.rstrip("s") in _PEST_TYPE_WORDS_SET)
+                    for s in _sp_for_phrase
+                ):
+                    print(f"🧠 Skipping description phrase '{req_phrase}' (generic pest-group search)")
                     req_phrase = None
                 if req_phrase:
                     before = len(all_results)
@@ -2819,6 +2949,19 @@ class MCPServer:
                 if re.search(rf"\b{re.escape(alias)}\b", norm):
                     for replacement in replacements:
                         variants.append(re.sub(rf"\b{re.escape(alias)}\b", replacement, norm))
+            # Also add a singularized form of each variant so plurals resolve against the (singular)
+            # common-name index, e.g. "whiteflies" → "whitefly", "mealybugs" → "mealybug". Strips a
+            # trailing -s and maps -ies → -y (so "whiteflies" doesn't become "whiteflie").
+            def _sing_word(w: str) -> str:
+                if len(w) > 4 and w.endswith("ies"):
+                    return w[:-3] + "y"
+                if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+                    return w[:-1]
+                return w
+            for value in list(variants):
+                singular = " ".join(_sing_word(t) for t in value.split())
+                if singular != value:
+                    variants.append(singular)
             seen = set()
             unique = []
             for value in variants:
@@ -2878,6 +3021,12 @@ class MCPServer:
             }
             if not query_specific_terms or (len(query_specific_terms) < 2 and not query_pest_terms):
                 continue
+            # A lone color/quality adjective + a generic pest type ("white fly", "brown beetle") is too
+            # broad — it would match any fly/beetle of that color. Require a real (exact/n-gram) phrase
+            # match for these instead, so e.g. "white fly" cleanly reports "not in catalog" when there is
+            # no whitefly dataset rather than returning unrelated march flies. ("golden beetle" handled above.)
+            if query_specific_terms and query_specific_terms.issubset(_GENERIC_ADJECTIVE_WORDS):
+                continue
             matches = set()
             for common_phrase, dataset_names in index.items():
                 phrase_terms = {_singular_pest_type(t) for t in re.findall(r"[a-z]+", common_phrase)}
@@ -2897,6 +3046,8 @@ class MCPServer:
         # everything. Larval group nouns in _HEAD_NOUN_SEARCH_WORDS are included even when they are also
         # in _PEST_TYPE_WORDS_SET (e.g. caterpillar).
         def _sing_head(w: str) -> str:
+            if len(w) > 4 and w.endswith("ies"):
+                return w[:-3] + "y"
             return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
 
         for query_variant in query_variants:
@@ -3283,6 +3434,74 @@ class MCPServer:
                 return False
         return True
     
+    def _passes_tail_strict(self, result: Dict[str, Any], tail_filter: List[str]) -> bool:
+        """When the user asked for goats with tail up/down, keep ONLY items that actually say so.
+
+        Checks metadata tail_position/tail_positions, the category label (e.g. "tail-up"), and the
+        description ("tail up" / "tail is up"). Items with no explicit tail direction are excluded, so
+        the result set is restricted to images whose description/metadata confirms the tail position.
+        """
+        if not tail_filter:
+            return True
+        wanted = {str(t).lower().strip() for t in tail_filter if t}
+        if not wanted:
+            return True
+        meta = result.get("metadata") or {}
+
+        _UNDET_INNER = r"(undetermined|undetermend|indeterminate|unknown|not\s+visible|unclear|obscured|n/?a)"
+        _UNDET_RE = r"\b" + _UNDET_INNER + r"\b"
+
+        def _explicit_field_direction(text: str) -> str:
+            """For dedicated tail fields the value IS the tail position, so a bare up/down is meaningful.
+            Use word boundaries so 'group'/'upper' etc. never count."""
+            t = str(text or "").lower()
+            if not t:
+                return ""
+            if re.search(_UNDET_RE, t) or "tail-undetermined" in t:
+                return "undetermined"
+            if re.search(r"\bup\b", t) or "tail-up" in t or "tailup" in t:
+                return "up"
+            if re.search(r"\bdown\b", t) or "tail-down" in t or "taildown" in t:
+                return "down"
+            return ""
+
+        def _tail_proximate_direction(text: str) -> str:
+            """For free text (category/description) only count up/down when it is clearly about the TAIL,
+            e.g. 'tail up', 'tail is up', 'tail pointing up', 'tail held up', 'tail-up'. This avoids false
+            positives like 'group of goats' (substring 'up') or 'walking down a hill'."""
+            t = str(text or "").lower()
+            if not t or "tail" not in t:
+                return ""
+            if "tail-undetermined" in t or re.search(r"tail\b[^.]{0,20}" + _UNDET_INNER, t):
+                return "undetermined"
+            if re.search(r"tail[\s\-]*(is\s+|held\s+|pointing\s+|raised\s+|curl(?:ed|ing)?\s+|up\b|standing\s+)*up\b", t) or "tail-up" in t:
+                return "up"
+            if re.search(r"tail[\s\-]*(is\s+|held\s+|pointing\s+|hanging\s+|tucked\s+|lowered\s+|down\b)*down\b", t) or "tail-down" in t:
+                return "down"
+            # Generic "tail" + nearby up/down within a few words
+            m = re.search(r"tail\b[^.]{0,20}\bup\b", t)
+            if m:
+                return "up"
+            m = re.search(r"tail\b[^.]{0,20}\bdown\b", t)
+            if m:
+                return "down"
+            return ""
+
+        raw_tail = meta.get("tail_positions") or meta.get("tail_position")
+        if isinstance(raw_tail, list):
+            raw_tail = " ".join(str(x) for x in raw_tail if x)
+        item_dir = _explicit_field_direction(raw_tail)
+        if not item_dir:
+            item_dir = _tail_proximate_direction(meta.get("category"))
+        if not item_dir:
+            desc = meta.get("description") or result.get("description") or ""
+            if isinstance(desc, list):
+                desc = " ".join(str(x) for x in desc if x)
+            item_dir = _tail_proximate_direction(desc)
+        if not item_dir:
+            return False
+        return item_dir in wanted
+
     def _passes_plant_state_strict(self, result: Dict[str, Any], plant_state_filter: List[str]) -> bool:
         """When user asked for a specific plant_state (e.g. ripe/unripe), keep items that match.
         For 'ripe': exclude mixed unless description says ripe. For 'unripe': allow mixed if description mentions unripe.
