@@ -136,7 +136,7 @@ _ACTION_QUERY_MAP = {
     "sitting": ("sitting", "sit"),
     "alert": ("alert", "looking", "staring", "facing", "watching", "watch"),
     "hunting": ("hunting", "hunt"),
-    "flying": ("flying", "fly"),
+    "flying": ("flying", "flew", "soaring", "in flight"),
     "perching": ("perching", "perch", "perched"),
     "drinking": ("drinking", "drink"),
     "climbing": ("climbing", "climb"),
@@ -3085,6 +3085,7 @@ class MCPServer:
             specific = [
                 t for t in tokens
                 if len(t) >= 4 and t not in _PEST_TYPE_WORDS_SET and t not in _NON_SUBJECT_WORDS
+                and t not in _GENERIC_ADJECTIVE_WORDS
             ]
             if len(specific) == 1:
                 head_candidates.append(_sing_head(specific[0]))
