@@ -1939,7 +1939,13 @@ class MCPServer:
                             print(f"🧠 Added {len(bombus_datasets)} Bombus datasets by query phrase 'bumble bee'")
                 # When user asked for cat or dog, search only DOMESTIC_ANIMAL datasets (exclude pests like "Catocala", "Dog-Day Cicada")
                 species_lower = {s.lower().strip().replace(" ", "_") for s in species_filter if s}
-                if species_lower & {"cat", "dog"}:
+                # Normalize plurals ("cats" → "cat", "dogs" → "dog") so the domestic restriction still applies
+                # and we don't return wildlife like bobcat (which only matches because it ends in "cat").
+                species_lower_singular = {
+                    (s[:-1] if len(s) > 1 and s.endswith("s") and not s.endswith("ss") else s)
+                    for s in species_lower
+                }
+                if (species_lower | species_lower_singular) & {"cat", "dog"}:
                     before = len(datasets_to_search)
                     datasets_to_search = [
                         d for d in datasets_to_search
@@ -1949,7 +1955,7 @@ class MCPServer:
                         print(f"🧠 Species includes cat/dog → restricting to DOMESTIC_ANIMAL only ({len(datasets_to_search)} datasets, excluded {before - len(datasets_to_search)} pest/other)")
                 # When user asked for mouse (rodent), exclude PEST datasets so we don't return "mouse moth" etc.
                 query_lower = (query or "").lower()
-                if not (species_lower & {"cat", "dog"}) and (
+                if not ((species_lower | species_lower_singular) & {"cat", "dog"}) and (
                     (species_lower & {"mouse", "mice"}) or re.search(r"\bmouse\b|\bmice\b", query_lower)
                 ):
                     before = len(datasets_to_search)
@@ -2228,6 +2234,7 @@ class MCPServer:
                         filtered_results.sort(key=lambda x: (x.get('id') or ''))
                         page_results = filtered_results[offset:offset + limit]
                         for result in page_results:
+                            result['dataset'] = dataset  # set before image URL so canonical dataset_id naming is used
                             result['llm_confidence'] = self._calculate_result_confidence(result, query_understanding, query)
                             result['llm_reasoning'] = query_understanding.reasoning
                             result['llm_intent'] = query_understanding.intent
@@ -2240,6 +2247,7 @@ class MCPServer:
                     else:
                         # Smaller set: enrich all, sort by confidence, then slice
                         for result in filtered_results:
+                            result['dataset'] = dataset  # set before image URL so canonical dataset_id naming is used
                             result['llm_confidence'] = self._calculate_result_confidence(result, query_understanding, query)
                             result['llm_reasoning'] = query_understanding.reasoning
                             result['llm_intent'] = query_understanding.intent
@@ -2645,10 +2653,23 @@ class MCPServer:
     def _construct_image_url(self, result: Dict[str, Any]) -> str:
         """Construct image URL from result data. For datasets like goat/goat_2, images on disk use prefix (goat_..., goat_2_...)."""
         try:
+            from pathlib import Path
             metadata = result.get("metadata", {})
             result_id = result.get("id", "")
             dataset = result.get("dataset", "")
-            
+
+            # Extension hint from original_filename: disk files are often renamed to the canonical
+            # dataset id but keep their real extension (e.g. id "carrot_001" → "carrot_001.png",
+            # original_filename "007_image.png"). Used in fallbacks so we don't hardcode .jpg.
+            _known_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+            _orig_ext = ""
+            _of = metadata.get("original_filename") or ""
+            if _of:
+                _cand = Path(str(_of)).suffix.lower()
+                if _cand in _known_exts:
+                    _orig_ext = _cand
+            _id_ext = _orig_ext or ".jpg"
+
             # Priority 1: Check if image_url is explicitly set
             if "image_url" in result:
                 return result["image_url"]
@@ -2708,11 +2729,12 @@ class MCPServer:
                 return f"/images/{filename}"
             
             # Priority 5: Fallback — use correct filename (id already prefixed e.g. goat_001, or dataset_id)
+            # with the original file's extension (so e.g. carrot_001.png is requested, not .jpg).
             if result_id and dataset:
                 stem = result_id if result_id.startswith(dataset + "_") else f"{dataset}_{result_id}"
-                return f"/images/{stem}.jpg"
+                return f"/images/{stem}{_id_ext}"
             if result_id:
-                return f"/images/{result_id}.jpg"
+                return f"/images/{result_id}{_id_ext}"
             
             # If no image info, return placeholder
             return "/images/placeholder.jpg"
