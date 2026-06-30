@@ -1428,6 +1428,30 @@ class MCPServer:
                 if query_understanding.entities != _entities_before:
                     print(f"🧠 Removed substring-only entity/entities: {sorted(set(_entities_before) - set(query_understanding.entities))}")
 
+            # Whitefly is a compound pest common name. If it is not in the catalog, do not degrade
+            # "white fly" into generic species "fly" (which returns common flies) or adjective "white"
+            # (which returns white butterflies).
+            if query and (
+                re.search(r"\bwhite\s+(?:fly|flies)\b", query_lower)
+                or re.search(r"\bwhitefl(?:y|ies)\b", query_lower)
+            ):
+                common_index = self._build_common_name_index()
+                has_whitefly = any(
+                    "whitefly" in phrase.replace(" ", "")
+                    for phrase in common_index.keys()
+                )
+                if not has_whitefly:
+                    pretty = query.strip()
+                    print(f"🧠 '{pretty}' is a whitefly query but whitefly is not in the catalog")
+                    return {
+                        "query": query,
+                        "llm_understanding": query_understanding,
+                        "results": [],
+                        "total_count": 0,
+                        "error": f"'{pretty}' is not in our catalog yet. Try a different species, or pick a Category to browse what's available.",
+                        "searched_datasets": [],
+                    }
+
             # Collapse an over-expanded species filter. The rule-based matcher can expand a bare group word
             # like "grasshopper" into every matching common name (e.g. 60 "* grasshopper" species). Their
             # shared descriptor segments ("eastern", "bird") then wrongly match wildlife datasets (skunk,
@@ -1942,6 +1966,8 @@ class MCPServer:
                 # Normalize singular/plural so "moths" matches dataset species "moth"
                 def _normalize_plural(s: str) -> str:
                     s = s.lower().strip()
+                    if len(s) > 4 and s.endswith("ies"):
+                        return s[:-3] + "y"  # "butterflies" -> "butterfly", "flies" -> "fly"
                     if len(s) > 1 and s.endswith("s") and not s.endswith("ss"):
                         return s[:-1]  # "moths" -> "moth"
                     return s
