@@ -90,6 +90,15 @@ _HEAD_NOUN_SEARCH_WORDS = {
     "caterpillar", "caterpillars", "cutworm", "cutworms", "maggot", "maggots",
     "armyworm", "armyworms", "hornworm", "hornworms", "borer", "borers",
     "looper", "loopers", "grub", "grubs", "webworm", "webworms", "sawfly", "sawflies",
+    "earworm", "earworms",
+}
+
+# Context words in a query (e.g. "on a flower") may appear in descriptions under related terms.
+_DESCRIPTION_CONTEXT_SYNONYMS = {
+    "flower": ("flower", "flowers", "flowering", "bloom", "blooming", "inflorescence"),
+    "flowers": ("flower", "flowers", "flowering", "bloom", "blooming", "inflorescence"),
+    "leaf": ("leaf", "leaves", "foliage"),
+    "leaves": ("leaf", "leaves", "foliage"),
 }
 
 # User-facing pest common-name aliases that may not be present literally in metadata.
@@ -1863,12 +1872,21 @@ class MCPServer:
                 def _is_generic_pest_word(s: str) -> bool:
                     s2 = s.lower().strip().replace("_", " ").replace("-", " ")
                     return s2 in _PEST_TYPE_WORDS_SET or s2.rstrip("s") in _PEST_TYPE_WORDS_SET
-                if all(_is_generic_pest_word(s) for s in current_species):
-                    specific_datasets = self._resolve_datasets_by_common_name(query)
-                    if specific_datasets:
-                        query_understanding.filters["species"] = sorted(specific_datasets)
+                cn_from_query = self._resolve_datasets_by_common_name(query)
+                if cn_from_query:
+                    replace_with_cn = all(_is_generic_pest_word(s) for s in current_species)
+                    if not replace_with_cn:
+                        # LLM may pin a literal common name (e.g. "corn earworm") that is not a dataset
+                        # name; prefer the catalog datasets resolved from the query phrase.
+                        cur_keys = {str(s).lower().strip().replace("_", " ").replace("-", " ") for s in current_species}
+                        cn_keys = {d.lower().replace("_", " ").replace("-", " ") for d in cn_from_query}
+                        replace_with_cn = not (cur_keys & cn_keys) and not any(
+                            ck in dk or dk.startswith(ck + " ") for ck in cur_keys for dk in cn_keys
+                        )
+                    if replace_with_cn:
+                        query_understanding.filters["species"] = sorted(cn_from_query)
                         cn_injected = True
-                        print(f"   ✅ Refined generic pest type {current_species} → specific datasets: {sorted(specific_datasets)}")
+                        print(f"   ✅ Refined species {current_species} → common-name datasets: {sorted(cn_from_query)}")
             
             if query_understanding.filters.get("species"):
                 print(f"   ✅ Species filter: {query_understanding.filters['species']}")
@@ -2293,8 +2311,11 @@ class MCPServer:
                     # words ARE the common name and were already used to pick datasets. Don't also require them
                     # literally in the description (image descriptions rarely repeat the common name verbatim).
                     if req_phrase and cn_injected:
-                        print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
-                        req_phrase = None
+                        cn_words = self._common_name_words_in_query(query)
+                        phrase_words = set(re.findall(r"[a-z]+", str(req_phrase).lower()))
+                        if not phrase_words or phrase_words <= cn_words:
+                            print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                            req_phrase = None
                     # Generic pest-group searches (e.g. "aphids on soybean leaves" → species ["aphid"]): the
                     # leftover host/descriptor words ("soybean") shouldn't be forced into the description, since
                     # pest images rarely repeat the host plant verbatim — that would drop all matches.
@@ -2524,8 +2545,11 @@ class MCPServer:
                     )
                 # Species resolved from a common name: don't also require those words in the description.
                 if req_phrase and cn_injected:
-                    print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
-                    req_phrase = None
+                    cn_words = self._common_name_words_in_query(query)
+                    phrase_words = set(re.findall(r"[a-z]+", str(req_phrase).lower()))
+                    if not phrase_words or phrase_words <= cn_words:
+                        print(f"🧠 Skipping description phrase '{req_phrase}' (species came from common-name match)")
+                        req_phrase = None
                 # Generic pest-group searches (e.g. "aphids on soybean leaves" → species ["aphid"]): don't force
                 # leftover host/descriptor words ("soybean") into the description or every match gets dropped.
                 _sp_for_phrase = [s.lower().strip() for s in (query_understanding.filters.get("species") or [])]
@@ -2987,6 +3011,24 @@ class MCPServer:
         print(f"🧠 Built common-name index: {len(self._common_name_index)} phrases")
         return self._common_name_index
 
+    def _common_name_words_in_query(self, query: str) -> set:
+        """Tokens that belong to a catalog common-name phrase embedded in the query (e.g. corn+earworm)."""
+        if not query or not query.strip():
+            return set()
+        index = self._build_common_name_index()
+        if not index:
+            return set()
+        tokens = re.findall(r"[a-z]+", query.lower())
+        matched = set()
+        for size in (4, 3, 2):
+            if size > len(tokens):
+                continue
+            for i in range(len(tokens) - size + 1):
+                phrase = " ".join(tokens[i:i + size])
+                if phrase in index:
+                    matched.update(tokens[i:i + size])
+        return matched
+
     def _resolve_datasets_by_common_name(self, query: str) -> List[str]:
         """Resolve a query to dataset name(s) via the common-name index, preferring the longest phrase
         match (e.g. "painted lady at night" → ["Vanessa_cardui"]). Returns [] when nothing matches."""
@@ -3434,11 +3476,13 @@ class MCPServer:
         # described as "foraging"/"feeding". Strip them (and punctuation) before forming the cultivar/variety phrase.
         def _norm_word(w: str) -> str:
             return re.sub(r"[^a-z]", "", w.lower())
+        cn_words = self._common_name_words_in_query(q)
         remaining = [
             w for w in words
             if w.lower() not in species_set
             and w.lower() not in stop
             and _norm_word(w) not in _NON_SUBJECT_WORDS
+            and _norm_word(w) not in cn_words
         ]
         if not remaining:
             return None
@@ -3463,10 +3507,21 @@ class MCPServer:
         desc = str(desc).lower()
         if want in desc:
             return True
+        # Accept related context terms (e.g. query "flower" matches description "flowering plant").
+        for token in re.findall(r"[a-z]+", want):
+            for variant in _DESCRIPTION_CONTEXT_SYNONYMS.get(token, ()):
+                if variant in desc:
+                    return True
         for key in ("species", "common_name", "scientific_name", "scene", "background"):
             val = meta.get(key)
             if val and want in str(val).lower():
                 return True
+            if val:
+                val_l = str(val).lower()
+                for token in re.findall(r"[a-z]+", want):
+                    for variant in _DESCRIPTION_CONTEXT_SYNONYMS.get(token, ()):
+                        if variant in val_l:
+                            return True
         return False
     
     def _passes_action_strict(self, result: Dict[str, Any], action_filter: List[str]) -> bool:
