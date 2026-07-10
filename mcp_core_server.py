@@ -173,7 +173,7 @@ _NON_SUBJECT_WORDS = {
     # scene / setting
     "field", "forest", "water", "mountain", "garden", "farm", "meadow", "indoor", "outdoor", "tree",
     "trees", "snow", "grass", "road", "sky", "barn", "pen", "enclosure", "cage", "bush", "leaf", "leaves",
-    "foliage", "background",
+    "foliage", "background", "flower", "flowers",
     # plant state / descriptors
     "ripe", "unripe", "mature", "immature", "blooming", "flowering", "fruiting", "green", "red",
     "edible", "ready",
@@ -1588,22 +1588,28 @@ class MCPServer:
                             query_understanding.filters["species"] = [dataset_names_lower[word_singular]]
                             print(f"   ✅ Injected species: ['{dataset_names_lower[word_singular]}'] from query word '{word}'")
                             break
-                # Generic subject-word → dataset match: e.g. "squirrel" → eastern_fox_squirrel, eaestern_gray_squirrel;
-                # "fox" → red_fox, grey_fox. Match query words as whole segments of dataset names (split on _ or -),
-                # preferring non-pest datasets so we don't pull in thousands of pests for a common animal word.
+                # Common-name phrase → scientific-name dataset (e.g. "painted lady" → Vanessa_cardui,
+                # "corn earworm" → Helicoverpa_zea). Run BEFORE generic subject-word injection so multi-word
+                # pest names are not exploded into separate matches on "corn", "earworm", "flower", etc.
+                if not query_understanding.filters.get("species"):
+                    cn_datasets = self._resolve_datasets_by_common_name(query)
+                    if cn_datasets:
+                        query_understanding.filters["species"] = sorted(cn_datasets)
+                        cn_injected = True
+                        print(f"   ✅ Injected species from common name → datasets: {sorted(cn_datasets)}")
+                # Generic subject-word → dataset match: only for SINGLE-word queries (e.g. "squirrel").
+                # Multi-word queries like "corn earworm on a flower" must use common-name resolution above.
                 if not query_understanding.filters.get("species"):
                     subject_words = [
                         w for w in re.findall(r"[a-z]+", query_lower)
                         if len(w) >= 3 and w not in _NON_SUBJECT_WORDS
                     ]
-                    non_pest_types = {"wildlife", "domestic_animal", "livestock", "plants"}
-                    seg_nonpest, seg_pest = [], []
-                    for word in subject_words:
+                    if len(subject_words) == 1:
+                        word = subject_words[0]
+                        non_pest_types = {"wildlife", "domestic_animal", "livestock", "plants"}
+                        seg_nonpest, seg_pest = [], []
                         word_sing = word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
-                        # Plain words match dataset name SEGMENTS (e.g. "squirrel" → eastern_fox_squirrel).
                         seg_terms = {word, word_sing}
-                        # Common-name synonyms (e.g. "groundhog" → "woodchuck") match as a substring so spelling
-                        # variants in dataset names still resolve.
                         syn_terms = {_SPECIES_SYNONYMS[w] for w in (word, word_sing) if w in _SPECIES_SYNONYMS}
                         for dn in self.dataset_registry.datasets:
                             dn_l = dn.lower()
@@ -1611,18 +1617,10 @@ class MCPServer:
                             if any(t in segs for t in seg_terms) or any(t in dn_l for t in syn_terms):
                                 dtype = self.dataset_registry.infer_type_from_name(dn)
                                 (seg_nonpest if dtype in non_pest_types else seg_pest).append(dn)
-                    chosen = sorted(set(seg_nonpest)) or sorted(set(seg_pest))
-                    if chosen:
-                        query_understanding.filters["species"] = chosen
-                        print(f"   ✅ Injected species from subject word(s) → datasets: {chosen}")
-                # Common-name phrase → scientific-name dataset (e.g. "painted lady" → Vanessa_cardui),
-                # for datasets named by scientific name where the common name lives in metadata.
-                if not query_understanding.filters.get("species"):
-                    cn_datasets = self._resolve_datasets_by_common_name(query)
-                    if cn_datasets:
-                        query_understanding.filters["species"] = sorted(cn_datasets)
-                        cn_injected = True
-                        print(f"   ✅ Injected species from common name → datasets: {sorted(cn_datasets)}")
+                        chosen = sorted(set(seg_nonpest)) or sorted(set(seg_pest))
+                        if chosen:
+                            query_understanding.filters["species"] = chosen
+                            print(f"   ✅ Injected species from subject word '{word}' → datasets: {chosen}")
                 # Rabbit = cottontail = white cottontail: if query mentions any and no species yet, use eastern_cottontail (not white_cottontail)
                 if not query_understanding.filters.get("species") and self.dataset_registry.datasets:
                     if "rabbit" in query_lower or "cottontail" in query_lower or "rabbits" in query_lower or "cottontails" in query_lower or "white cottontail" in query_lower or "white cottontails" in query_lower:
@@ -3027,6 +3025,16 @@ class MCPServer:
                 phrase = " ".join(tokens[i:i + size])
                 if phrase in index:
                     matched.update(tokens[i:i + size])
+        # Adjective + head-noun pest compounds (e.g. "corn earworm") even when the exact phrase is not indexed.
+        def _sing_head(w: str) -> str:
+            if len(w) > 4 and w.endswith("ies"):
+                return w[:-3] + "y"
+            return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+        for i, tok in enumerate(tokens):
+            head = _sing_head(tok)
+            if head in _HEAD_NOUN_SEARCH_WORDS and i > 0:
+                matched.add(tokens[i - 1])
+                matched.add(tok)
         return matched
 
     def _resolve_datasets_by_common_name(self, query: str) -> List[str]:
@@ -3501,27 +3509,47 @@ class MCPServer:
             return True
         want = required_phrase.lower().strip()
         meta = result.get("metadata") or {}
-        desc = (meta.get("description") or "")
+
+        def _token_matches_in_text(token: str, text: str) -> bool:
+            if not text:
+                return False
+            tl = text.lower()
+            if token in tl:
+                return True
+            for variant in _DESCRIPTION_CONTEXT_SYNONYMS.get(token, ()):
+                if variant in tl:
+                    return True
+            return False
+
+        desc = meta.get("description") or result.get("description") or ""
         if isinstance(desc, list):
             desc = " ".join(str(x) for x in desc if x)
         desc = str(desc).lower()
         if want in desc:
             return True
-        # Accept related context terms (e.g. query "flower" matches description "flowering plant").
-        for token in re.findall(r"[a-z]+", want):
-            for variant in _DESCRIPTION_CONTEXT_SYNONYMS.get(token, ()):
-                if variant in desc:
-                    return True
+        tokens = re.findall(r"[a-z]+", want)
+        if len(tokens) > 1:
+            # Multi-word phrases require EVERY token to match (e.g. "corn earworm flower" needs corn AND
+            # earworm AND flower/flowering — not just any insect on a flowering plant).
+            if not all(_token_matches_in_text(tok, desc) for tok in tokens):
+                return False
+            return True
+        # Single context word: accept synonym variants (e.g. "flower" ↔ "flowering").
+        if tokens and _token_matches_in_text(tokens[0], desc):
+            return True
         for key in ("species", "common_name", "scientific_name", "scene", "background"):
             val = meta.get(key)
-            if val and want in str(val).lower():
+            if not val:
+                continue
+            val_l = str(val).lower()
+            if want in val_l:
                 return True
-            if val:
-                val_l = str(val).lower()
-                for token in re.findall(r"[a-z]+", want):
-                    for variant in _DESCRIPTION_CONTEXT_SYNONYMS.get(token, ()):
-                        if variant in val_l:
-                            return True
+            if tokens:
+                if len(tokens) > 1:
+                    if all(_token_matches_in_text(tok, val_l) for tok in tokens):
+                        return True
+                elif _token_matches_in_text(tokens[0], val_l):
+                    return True
         return False
     
     def _passes_action_strict(self, result: Dict[str, Any], action_filter: List[str]) -> bool:
